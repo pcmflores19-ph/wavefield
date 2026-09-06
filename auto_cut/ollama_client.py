@@ -83,27 +83,3 @@ def free_vram(log=None):
             freed += megabytes
     return freed
 
-
-def placement(model_name, timeout=3.0):
-    """
-    Where a loaded model is actually running.
-
-    Ollama offloads to GPU only as far as VRAM allows; on a 6GB card a large
-    model can land partly or wholly on the CPU, which is the difference between
-    seconds and minutes per request. Worth telling the user rather than leaving
-    them wondering why correction crawls.
-    """
-    for entry in loaded_models(timeout=timeout):
-        if entry["name"] != model_name:
-            continue
-        total = entry.get("size") or 0
-        vram = entry.get("size_vram") or 0
-        if not total:
-            return "GPU" if vram else "CPU", 0
-        percent = 100.0 * vram / total
-        if percent >= 99:
-            return "GPU", 100
-        if percent <= 1:
-            return "CPU", 0
-        return "partly GPU", percent
-    return None, 0

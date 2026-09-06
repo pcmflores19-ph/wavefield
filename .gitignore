@@ -46,3 +46,10 @@ packaging/logo-source.png
 # the build - never source.
 auto_cut/ffmpeg/
 packaging/version_info.txt
+
+# Working notes for AI coding assistants, and a stray folder listing. Useful
+# on this machine, but not part of what someone downloads or builds.
+.claude/
+.claudeignore
+CLAUDE.md
+structure.txt
