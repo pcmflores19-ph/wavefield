@@ -69,9 +69,20 @@ Name: "desktopicon"; Description: "Create a &desktop shortcut"; \
     GroupDescription: "Additional shortcuts:"
 
 [Files]
-; The whole PyInstaller one-folder build, ffmpeg included.
+; The whole PyInstaller one-folder build, ffmpeg included. The three Microsoft
+; C++ runtime DLLs are left out here and installed by the entry below.
 Source: "..\dist\Wavefield\*"; DestDir: "{app}"; \
+    Excludes: "\_internal\MSVCP140.dll,\_internal\VCRUNTIME140.dll,\_internal\VCRUNTIME140_1.dll"; \
     Flags: ignoreversion recursesubdirs createallsubdirs
+
+; The Microsoft C++ runtime, without ignoreversion. These three are identical
+; from build to build, so left to its own judgement Setup compares versions,
+; sees nothing newer and skips them - rather than trying to overwrite a DLL
+; that another running program is holding open, which fails with
+; "DeleteFile failed; code 5" and aborts the upgrade.
+Source: "..\dist\Wavefield\_internal\MSVCP140.dll"; DestDir: "{app}\_internal"
+Source: "..\dist\Wavefield\_internal\VCRUNTIME140.dll"; DestDir: "{app}\_internal"
+Source: "..\dist\Wavefield\_internal\VCRUNTIME140_1.dll"; DestDir: "{app}\_internal"
 
 ; Also beside the .exe, not only in _internal, so the [Run] entry
 ; below and the Settings button can both name one obvious path.
