@@ -75,7 +75,7 @@ python packaging/build.py
 ```
 
 Icon, plugins, PyInstaller, Inno Setup. Out comes
-`packaging/output/AutoCut-Setup-<version>.exe`, around 100 MB.
+`packaging/output/Wavefield-Setup-<version>.exe`, around 100 MB.
 
 **Install it and run a real episode before going further.** A frozen build can
 fail in ways running from source never does.
@@ -99,8 +99,11 @@ named anything else will not be recognised.
 
 - **Tag**: pick the `v1.1.0` you just pushed
 - **Title**: `Wavefield 1.1.0`
-- **Attach the installer**: drag `AutoCut-Setup-1.1.0.exe` into the box. This
+- **Attach the installer**: drag `Wavefield-Setup-1.1.0.exe` into the box. This
   matters — without an attached file people have to build it themselves.
+- **Paste the checksum** into the release notes. `build.py` prints it at the
+  end, as `SHA-256: ...`. People use it to confirm their download is really
+  the file you published — the only way to check that until signing lands.
 - **Publish release**
 
 Then check *Help ▸ Check for updates* in an older copy. It should offer the new
@@ -115,5 +118,7 @@ version. That is the whole feature working end to end.
   info ▸ Run anyway**. Signing needs a certificate at roughly $200/year, which
   is hard to justify for a free tool — but say so in the release notes so it
   does not look alarming.
-- The built binary is **GPL-3**, because it bundles pedalboard. The source
-  stays MIT. Do not describe the installer itself as MIT.
+- **Everything here is GPL-3** — the source and the built installer alike,
+  because Wavefield bundles pedalboard and rnnoise, which are GPL. See
+  [LICENSE](../LICENSE). This project was briefly and wrongly described as MIT;
+  do not reintroduce that anywhere, in the repository or in release notes.

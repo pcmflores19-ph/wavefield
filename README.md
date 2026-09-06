@@ -35,6 +35,59 @@ do it later from **File > Settings**.
 >
 > To continue: click **More info**, then **Run anyway**.
 
+### Check your download
+
+Every release lists a **SHA-256** — a long code that acts as a fingerprint for
+that exact file. If your copy produces the same code, it is byte-for-byte the
+file published here and nobody has altered it on the way to you.
+
+Open PowerShell in your Downloads folder and run:
+
+```powershell
+Get-FileHash .\Wavefield-Setup-1.1.0.exe
+```
+
+Compare what it prints against the SHA-256 in the
+[release notes](../../releases/latest). They should match exactly; upper or
+lower case does not matter. If they do not match, delete the file and download
+it again from the Releases page — and please
+[report it](../../issues).
+
+This is worth doing because Wavefield is not yet code-signed. Until it is, the
+checksum is the honest way to tell a real copy from a tampered one.
+
+<details>
+<summary><b>The download vanished, or Windows says it found a virus</b> — a false positive</summary>
+
+Microsoft Defender sometimes deletes or quarantines the installer, so the file
+simply disappears from your Downloads folder, occasionally with a message about
+a trojan.
+
+**This is a false positive, and it is being formally disputed with Microsoft.**
+It happens because Wavefield is built with a tool called PyInstaller, which
+packs a program and its Python runtime into one executable. Some malware does
+the same, so unsigned PyInstaller files get flagged on pattern alone. Code
+signing is what ends this for good, and the application for it is pending.
+
+If you would rather not wait, here is how to get the file back — but please do
+the middle step, because the whole point is to be sure it is genuinely ours:
+
+1. Open **Windows Security ▸ Virus & threat protection ▸ Protection history**.
+2. Find the Wavefield entry, open it, and choose **Actions ▸ Allow on device**.
+3. **Before running it, check the SHA-256** as described in
+   [Check your download](#check-your-download). If it matches the release
+   notes, the file is exactly what was published here.
+
+**Do not turn Defender off.** You never need to, and nothing about Wavefield is
+worth doing that for. Allowing one file you have verified is enough.
+
+If you would rather trust nothing you cannot inspect, that is entirely
+reasonable — the full source is in this repository and
+[docs/DEVELOPERS.md](docs/DEVELOPERS.md) explains how to build the installer
+yourself.
+
+</details>
+
 <details>
 <summary><b>"An Application Control policy has blocked this file"</b> — a different, harder block</summary>
 
@@ -293,9 +346,11 @@ version, you have to make your source available under the same licence.
 Release builds are signed so Windows can verify they came from this project and
 have not been altered since.
 
-> **Status:** signing is being set up now. Builds up to and including v1.0.0 are
-> **not** signed, which is why Windows may warn about them or, on some machines,
-> refuse to run them. See [Download](#download) for what to do meanwhile.
+> **Status:** signing is not in place yet — an application to the SignPath
+> Foundation is pending, so **no release so far is signed**. That is why
+> Windows may warn about a download or, on some machines, refuse to run it.
+> Until it is granted, verify a download with its checksum instead: see
+> [Download](#download). This notice will change here once signing is live.
 
 - Wavefield is built and signed **only** by the automated release workflow in
   [`.github/workflows/`](.github/workflows), from the source in this
@@ -309,8 +364,11 @@ have not been altered since.
   [Releases page](../../releases/latest) of this repository. A copy of
   Wavefield obtained anywhere else is not something this project can vouch for.
 
-To check a download yourself: right-click the file, choose **Properties**, and
-look at the **Digital Signatures** tab.
+To check a download yourself: **while signing is pending**, compare its
+checksum against the one in the release notes — see
+[Check your download](#check-your-download). Once signing is live you will also
+be able to right-click the file, choose **Properties**, and look at the
+**Digital Signatures** tab; that tab is empty until then.
 
 ### Privacy
 

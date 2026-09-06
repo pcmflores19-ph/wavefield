@@ -8,7 +8,7 @@ Steps, in order:
     1. icon        PNG -> autocut.ico + auto_cut/assets/autocut.png
     2. plugins     download the bundled VST3s (skipped if already there)
     3. PyInstaller dist/AutoCut/
-    4. Inno Setup  packaging/output/AutoCut-Setup-<version>.exe
+    4. Inno Setup  packaging/output/Wavefield-Setup-<version>.exe
 
 The version comes from auto_cut/version.py and is passed to Inno on the command
 line, so the installer, the About box and the update check can no longer
@@ -20,6 +20,7 @@ Options:
     --no-installer   stop after PyInstaller
 """
 
+import hashlib
 import os
 import re
 import shutil
@@ -119,6 +120,17 @@ def main():
     if os.path.exists(output):
         size = os.path.getsize(output) / 1e6
         print(f"\ndone: {output}  ({size:.0f} MB)")
+
+        # Goes in the release notes. Until the builds are code-signed this is
+        # the only way someone can confirm the installer they downloaded is
+        # the one published here, so it is printed rather than left to be
+        # remembered. Read in chunks: the installer is ~100 MB.
+        digest = hashlib.sha256()
+        with open(output, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        print(f"SHA-256: {digest.hexdigest()}")
+        print("Paste that into the GitHub release notes - see docs/RELEASING.md")
 
 
 if __name__ == "__main__":

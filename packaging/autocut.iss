@@ -4,7 +4,7 @@
 ;     pyinstaller packaging/autocut.spec --noconfirm
 ;     "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" packaging\autocut.iss
 ;
-; Produces packaging/output/AutoCut-Setup-<version>.exe - one file to hand to
+; Produces packaging/output/Wavefield-Setup-<version>.exe - one file to hand to
 ; someone, no Python and no ffmpeg needed on their machine.
 
 #define AppName "Wavefield"
