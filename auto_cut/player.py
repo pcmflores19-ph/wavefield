@@ -19,12 +19,13 @@ import numpy as np
 import sounddevice as sd
 
 import bundled
+import settings
 
 # Matches audio_export.MUTE_FADE_SECONDS - what you hear must be what you get.
 MUTE_FADE_SECONDS = 0.010
 
 SAMPLE_RATE = 44100
-CACHE_DIR = os.path.join(os.path.dirname(__file__), ".cache")
+CACHE_DIR = settings.cache_dir()
 
 
 def _pcm_cache_path(audio_path):

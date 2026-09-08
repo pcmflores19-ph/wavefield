@@ -40,6 +40,24 @@ def config_dir():
     return os.path.join(base, APP_DIR_NAME.lower())
 
 
+def cache_dir():
+    """
+    Where decoded audio and transcripts are cached - regenerable, and can run
+    to hundreds of MB an episode, so LOCALAPPDATA (never synced) rather than
+    the small roaming settings.json above.
+
+    Must never be beside the program itself: an installed copy sits under
+    Program Files, which a standard user cannot write to, and PyInstaller's
+    __file__ points inside it.
+    """
+    if os.name == "nt":
+        base = (os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+                 or os.path.expanduser("~"))
+        return os.path.join(base, APP_DIR_NAME, "cache")
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    return os.path.join(base, APP_DIR_NAME.lower())
+
+
 def config_path():
     return os.path.join(config_dir(), FILE_NAME)
 

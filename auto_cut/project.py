@@ -16,6 +16,7 @@ import base64
 import chain_io
 import json
 import os
+import settings
 import time
 
 FORMAT_VERSION = 2
@@ -122,7 +123,7 @@ AUTOSAVE_SECONDS = 60
 
 def autosave_path():
     """Beside the cache, not beside the user's project - it's scratch state."""
-    directory = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache")
+    directory = settings.cache_dir()
     os.makedirs(directory, exist_ok=True)
     return os.path.join(directory, AUTOSAVE_NAME)
 

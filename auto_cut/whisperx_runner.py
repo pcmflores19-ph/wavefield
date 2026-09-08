@@ -18,6 +18,8 @@ import subprocess
 import sys
 import tempfile
 
+import settings as _settings
+
 NL = chr(10)
 
 def _candidate_executables():
@@ -135,7 +137,7 @@ def whisperx_executable():
     return resolve()[0]
 
 
-CACHE_DIR = os.path.join(os.path.dirname(__file__), ".cache")
+CACHE_DIR = _settings.cache_dir()
 
 DEFAULT_MODEL = "large-v2"
 DEFAULT_BATCH_SIZE = 4
