@@ -639,6 +639,7 @@ class UIBuilderMixin:
         self.canvas.bind("<ButtonRelease-1>", self._on_release)
         self.canvas.bind("<Configure>", lambda e: self._draw_waveform())
         self.canvas.bind("<MouseWheel>", self._on_wheel)
+        self.canvas.bind("<Shift-MouseWheel>", self._on_shift_wheel)
 
         ttk.Button(zoom, text="-", width=3,
                    command=lambda: self._zoom(1.4)).pack(side="left")
@@ -648,9 +649,26 @@ class UIBuilderMixin:
                    command=self._zoom_fit).pack(side="left")
         self.zoom_label = ttk.Label(zoom, text="", style="PanelDim.TLabel")
         self.zoom_label.pack(side="left", padx=10)
+
+        # Vertical magnification, separate from the timeline zoom above: the
+        # waveform is drawn at true scale, so a quietly-recorded track needs
+        # a way to be made readable without pretending it is louder.
+        ttk.Label(zoom, text="Height", style="PanelDim.TLabel").pack(side="left")
+        ttk.Button(zoom, text="-", width=3,
+                   command=lambda: self._zoom_waveform(1 / 2.0)
+                   ).pack(side="left", padx=(4, 0))
+        ttk.Button(zoom, text="+", width=3,
+                   command=lambda: self._zoom_waveform(2.0)).pack(side="left", padx=2)
+        ttk.Button(zoom, text="Reset", width=6,
+                   command=self._reset_waveform_gain).pack(side="left")
+        self.waveform_gain_label = ttk.Label(zoom, text="",
+                                             style="PanelDim.TLabel")
+        self.waveform_gain_label.pack(side="left", padx=6)
+
         self.play_hint = ttk.Label(
             zoom, style="PanelDim.TLabel",
-            text="click seek   |   drag select   |   shift-drag pan   |   wheel zoom")
+            text="click seek   |   drag select   |   shift-drag pan   |   "
+                 "wheel zoom   |   shift-wheel height")
         self.play_hint.pack(side="right")
 
     def _build_vodcast_menu(self, menubar):

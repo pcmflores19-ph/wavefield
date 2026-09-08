@@ -118,31 +118,32 @@ def peaks_from_samples(samples, buckets):
     return _peaks_from_samples(samples, buckets)
 
 
-def processed_peaks(path, chain, duration_seconds, denoiser_path=None,
+def processed_peaks(path, chain, duration_seconds, log=None,
                     peaks_per_second=PEAKS_PER_SECOND):
     """
-    Peaks for one speaker AFTER their VST chain, so the drawn waveform matches
-    what you actually hear.
+    Peaks for one speaker: the real recording, with their VST chain on top.
 
-    Starts from the same cleaned-for-analysis baseline the waveform is drawn
-    from right after Analyze (see voice_activity.cleaned_samples_for) rather
-    than the raw file - otherwise the picture visibly jumps the moment you
-    touch the effects chain, as if the analysis cleanup had switched off. It's
-    disk-cached from the Analyze step, so this costs a chain pass, not another
-    decode-and-clean. Nothing here is baked into the audio you hear or export
-    - only the display.
+    Deliberately the RAW file, not the denoised/levelled copy the analysis
+    uses. The waveform has to be the audio - a picture normalized to -14 LUFS
+    can never show clipping, and a picture already denoised makes the user's
+    own denoiser look like it does nothing. What the analysis does to decide
+    the cuts is its own business; see voice_activity.clean_for_analysis.
+
+    Both the at-rest draw and the redraw after a chain edit come through here,
+    so the two can never disagree.
     """
     import numpy as np
-    from player import SAMPLE_RATE
-    from voice_activity import cleaned_samples_for
+    from player import SAMPLE_RATE, decode_to_pcm
 
-    samples = cleaned_samples_for(path, denoiser_path)
+    pcm_path = decode_to_pcm(path)
+    samples = np.asarray(np.memmap(pcm_path, dtype=np.int16, mode="r"),
+                         dtype=np.float32) / 32768.0
 
     if chain is not None and chain.active_slots():
         # A detached copy: the live chain belongs to the audio callback, and
         # pushing an hour of audio through it from here would stall the audio
         # thread and drive the same VST from two threads at once.
-        offline = chain.snapshot()
+        offline = chain.snapshot(log=log)
         processed = offline.process(samples, SAMPLE_RATE, reset=True)
         if processed.size == samples.size:
             samples = processed

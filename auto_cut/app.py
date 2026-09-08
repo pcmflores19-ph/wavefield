@@ -40,11 +40,19 @@ from silence_detector import (aggressiveness_to_min_gap, apply_mute_edits,
                               compute_auto_mutes_from_intervals,
                               compute_keep_ranges_from_intervals, summarize)
 import voice_activity
-from waveform import PEAKS_PER_SECOND, peaks_from_samples, processed_peaks
+from waveform import processed_peaks
 from whisperx_runner import language_label, model_label, transcribe
 
 LANE_HEIGHT = 74             # per-speaker waveform lane
 RULER_HEIGHT = 18
+
+# A sample this close to full scale is an over. Drawn red, like any DAW, and
+# always measured on the true sample - never on the zoomed height - so
+# magnifying a quiet track can never invent a clip that isn't there.
+CLIP_LEVEL = 0.999
+CLIP_COLOR = "#e05252"
+WAVEFORM_GAIN_STEP = 2.0
+MAX_WAVEFORM_GAIN = 64.0
 SCENE_ROW_HEIGHT = 20        # one row per camera in the CAMERAS strip
 
 # A camera takes the colour of the waveform it belongs to: V1 is drawn in the
@@ -99,6 +107,10 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
         self.playhead = None
         self.view_start = 0.0
         self.view_span = 0.0
+        # Vertical magnification of the drawn waveform only. The peaks
+        # themselves stay true, so a quiet track can be made readable without
+        # the picture lying about its level.
+        self.waveform_gain = 1.0
         self.log_queue = queue.Queue()
         self.player = Player()
         self.track_vars = []
@@ -461,36 +473,31 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
             duration = max(m.duration_seconds for m in media)
 
             denoiser = voice_activity.find_denoiser()
-            # Stashed for _peaks_worker, which redraws through the effects
-            # chain later and needs to start from the same cleaned baseline -
-            # otherwise the waveform jumps the moment the chain is touched.
-            self._denoiser = denoiser
-            self.log("Analyzing waveforms")
 
-            # The waveform you see, the cuts, and auto-mute all come from the
-            # same cleaned-up copy of each track (see
-            # voice_activity.clean_for_analysis) - denoised and levelled for
-            # analysis only, never baked into the audio you hear or export.
-            buckets = max(1, int(round(duration * PEAKS_PER_SECOND)))
+            # The cuts and auto-mute are decided from a denoised, levelled
+            # copy of each track (voice_activity.clean_for_analysis). The
+            # WAVEFORM is not: it draws the real recording, so it can show
+            # clipping and so the user's own effects visibly change it. Two
+            # different questions, two different signals.
             saved = getattr(self, "_saved_speech", None)
             levels_per_speaker = []
             peaks_list = []
             hop = None
             if saved and len(saved) == len(self.speaker_paths):
                 speech_per_speaker = saved
-                for path in self.speaker_paths:
-                    cleaned = voice_activity.cleaned_samples_for(
-                        path, denoiser, log=self.log)
-                    peaks_list.append(peaks_from_samples(cleaned, buckets))
+                for index, path in enumerate(self.speaker_paths):
+                    self.log(f"Analyzing waveforms of {os.path.basename(path)}")
+                    peaks_list.append(self._peaks_for(index, path, duration))
             else:
                 speech_per_speaker = []
-                for path in self.speaker_paths:
-                    intervals, levels, hop, cleaned = voice_activity.speaking_intervals(
+                for index, path in enumerate(self.speaker_paths):
+                    self.log(f"Analyzing waveforms of {os.path.basename(path)}")
+                    intervals, levels, hop = voice_activity.speaking_intervals(
                         path, denoiser, duration=duration, log=self.log,
-                        with_levels=True, with_samples=True)
+                        with_levels=True)
                     speech_per_speaker.append(intervals)
                     levels_per_speaker.append(levels)
-                    peaks_list.append(peaks_from_samples(cleaned, buckets))
+                    peaks_list.append(self._peaks_for(index, path, duration))
             self._saved_speech = None
 
             self.log("Preparing audio for playback ...")
@@ -1204,6 +1211,8 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
 
             n = len(peaks)
             per_second = n / self.timeline_duration
+            half = LANE_HEIGHT / 2 - 3
+            gain = self.waveform_gain
             for x in range(int(width)):
                 t0 = start + (x / width) * span
                 t1 = start + ((x + 1) / width) * span
@@ -1212,8 +1221,14 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
                 if lo >= n:
                     continue
                 amp = float(peaks[lo:hi].max())
-                h = amp * (LANE_HEIGHT / 2 - 3)
-                self.canvas.create_line(x, mid - h, x, mid + h, fill=color)
+                # Clipping is judged on the real sample; the gain only
+                # magnifies the drawing. Height is capped at the lane edge so
+                # a magnified or over-scale peak stops there instead of
+                # drawing across its neighbour.
+                h = min(amp * gain, 1.0) * half
+                self.canvas.create_line(
+                    x, mid - h, x, mid + h,
+                    fill=CLIP_COLOR if amp >= CLIP_LEVEL else color)
 
             # Hand-muted regions on this speaker's lane.
             for lane, m_start, m_end in self._drawn_mutes:
@@ -1375,6 +1390,36 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
         self.view_start = 0.0
         self.view_span = self.timeline_duration
         self._draw_waveform()
+
+    def _zoom_waveform(self, factor):
+        """
+        Magnifies the drawn waveform vertically. Drawing only - the stored
+        peaks and everything decided from them are untouched, so this can
+        make a quietly-recorded track readable without making it look loud.
+        """
+        self.waveform_gain = max(1.0, min(MAX_WAVEFORM_GAIN,
+                                          self.waveform_gain * factor))
+        self._update_waveform_gain_label()
+        self._draw_waveform()
+
+    def _reset_waveform_gain(self):
+        self.waveform_gain = 1.0
+        self._update_waveform_gain_label()
+        self._draw_waveform()
+
+    def _update_waveform_gain_label(self):
+        label = getattr(self, "waveform_gain_label", None)
+        if label is not None:
+            label.config(text=""  if self.waveform_gain <= 1.0
+                         else f"x{self.waveform_gain:g}")
+
+    def _on_shift_wheel(self, event):
+        # Vertical magnification, so the modifier does the same kind of thing
+        # to the other axis as a plain wheel does to the timeline.
+        if not self.peaks_list:
+            return "break"
+        self._zoom_waveform(2.0 if event.delta > 0 else 1 / 2.0)
+        return "break"
 
     def _on_wheel(self, event):
         # Zooms the waveform under the cursor.
@@ -1866,15 +1911,22 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
         self._peaks_busy = True
         threading.Thread(target=self._peaks_worker, daemon=True).start()
 
+    def _peaks_for(self, index, path, duration):
+        """
+        One speaker's drawn peaks: the real recording with their own chain on
+        top. The single place peaks are made, so the picture after Analyze and
+        the picture after a chain edit cannot drift apart.
+        """
+        chain = (self.track_chains[index]
+                 if index < len(self.track_chains) else None)
+        return processed_peaks(path, chain, duration, log=self.log)
+
     def _peaks_worker(self):
         try:
             updated = []
             for index, path in enumerate(self.speaker_paths):
-                chain = (self.track_chains[index]
-                         if index < len(self.track_chains) else None)
-                updated.append(processed_peaks(
-                    path, chain, self.timeline_duration,
-                    denoiser_path=getattr(self, "_denoiser", None)))
+                updated.append(
+                    self._peaks_for(index, path, self.timeline_duration))
             self.root.after(0, lambda: self._peaks_refreshed(updated))
         except Exception as exc:
             self.log(f"Could not redraw the waveform through the effects: {exc}")
