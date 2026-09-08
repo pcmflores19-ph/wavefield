@@ -144,6 +144,7 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
         # a check that fires into a half-drawn window has nowhere to show its
         # result.
         self.root.after(2500, self._startup_update_check)
+        self.root.after(3000, self._start_cache_prune)
         root.bind("<space>", self._on_space)
         self._bind_shortcuts(root)
         root.bind_all("<MouseWheel>", self._on_wheel_anywhere)
@@ -903,6 +904,22 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
         if not settings.get("check_updates_on_start"):
             return
         self.check_for_updates(announce=False)
+
+    def _start_cache_prune(self):
+        """
+        Keeps the decoded/cleaned/transcript cache from growing forever.
+        Off the UI thread and silent either way - this is routine
+        housekeeping, not something worth a status line, and deleting files
+        is not instant on a slow disk.
+        """
+        threading.Thread(target=self._prune_cache_worker, daemon=True).start()
+
+    def _prune_cache_worker(self):
+        import settings
+        try:
+            settings.prune_cache()
+        except Exception:
+            pass                  # best-effort housekeeping, never fatal
 
     def _updates_worker(self, announce=True):
         import updates

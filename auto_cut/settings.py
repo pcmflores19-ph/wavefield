@@ -12,9 +12,16 @@ stop the app starting; it just falls back to defaults.
 
 import json
 import os
+import time
 
 APP_DIR_NAME = "AutoCut"
 FILE_NAME = "settings.json"
+
+# The one thing in cache_dir() that is not a rebuildable cache - project.py's
+# crash-recovery autosave. Named here rather than imported (project.py
+# already imports settings; importing it back would be circular) so pruning
+# and "Clear cache" can never touch it.
+_PROTECTED_CACHE_FILES = {"recovery.autocut"}
 
 DEFAULTS = {
     # Blank means "find it yourself". A path here is a deliberate override for
@@ -107,3 +114,88 @@ def set_value(key, value):
         return True
     except Exception:
         return False             # read-only profile, locked file, full disk
+
+
+def _cache_entries():
+    directory = cache_dir()
+    if not os.path.isdir(directory):
+        return []
+    entries = []
+    for name in os.listdir(directory):
+        if name in _PROTECTED_CACHE_FILES:
+            continue
+        path = os.path.join(directory, name)
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        if os.path.isfile(path):
+            entries.append([path, st.st_size, st.st_atime, st.st_mtime])
+    return entries
+
+
+def clear_cache():
+    """
+    Deletes every regenerable cache file (decoded audio, cleaned audio,
+    transcripts) - never the crash-recovery autosave. Best-effort per file: a
+    file another part of the app is still using (memory-mapped for playback,
+    say) is skipped rather than raised as an error, the same way every other
+    cache access here is.
+
+    Returns (files_removed, bytes_freed, files_skipped) so a caller - the
+    Settings dialog's "Clear cache" button - can report something concrete.
+    """
+    removed = freed = skipped = 0
+    for path, size, _atime, _mtime in _cache_entries():
+        try:
+            os.remove(path)
+            removed += 1
+            freed += size
+        except OSError:
+            skipped += 1
+    return removed, freed, skipped
+
+
+def prune_cache(max_total_bytes=2_000_000_000, max_age_days=14):
+    """
+    Keeps the analysis cache from growing forever, without ever deleting the
+    crash-recovery autosave or a file something else has locked open.
+
+    Two passes: first, anything older than max_age_days goes regardless of
+    size (a cache entry nobody has touched in two weeks is not earning its
+    disk space); then, if still over max_total_bytes, the least-recently-used
+    survivors go next until back under budget. A locked file (memory-mapped
+    for playback, most likely) is left in place either way - the OS itself
+    refuses that delete, this just doesn't treat it as an error.
+
+    Meant to run once, early, in a background thread - see
+    app._prune_cache_worker - not on any hot path.
+    """
+    entries = _cache_entries()
+    if not entries:
+        return
+
+    now = time.time()
+    survivors = []
+    for entry in entries:
+        path, size, atime, mtime = entry
+        if (now - mtime) / 86400.0 > max_age_days:
+            try:
+                os.remove(path)
+                continue
+            except OSError:
+                pass                     # in use - leave it, count it below
+        survivors.append(entry)
+
+    total = sum(e[1] for e in survivors)
+    if total <= max_total_bytes:
+        return
+    survivors.sort(key=lambda e: e[2])   # oldest-accessed first
+    for path, size, _atime, _mtime in survivors:
+        if total <= max_total_bytes:
+            break
+        try:
+            os.remove(path)
+            total -= size
+        except OSError:
+            continue                     # in use - skip, try the next oldest

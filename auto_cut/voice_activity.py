@@ -208,6 +208,52 @@ def _k_weight(samples, sample_rate):
     return _biquad(stage1, *hpf)
 
 
+# _k_weight is the expensive part of measuring loudness - a genuinely
+# sequential biquad, sample by sample, with no numba here to speed it up (see
+# clean_for_analysis's docstring on why one isn't added). Running it over
+# literally every sample of an hour-long track cost minutes per speaker.
+# Integrated loudness is already a statistic over many 400ms blocks, so past
+# a certain length we K-weight a representative, evenly-spaced sample of the
+# track instead of all of it - the same gating decides the result either way,
+# just from fewer blocks. Short tracks are still measured in full.
+_LUFS_FULL_SCAN_SECONDS = 20.0     # tracks up to this long: no sampling
+_LUFS_WINDOW_SECONDS = 2.0         # length of each sampled window
+_LUFS_SAMPLE_COVERAGE = 0.25       # fraction of a long track actually scanned
+
+
+def _block_mean_squares(weighted, sample_rate):
+    """Mean square per 400ms block on a 100ms hop, for one contiguous
+    K-weighted signal."""
+    block = int(0.400 * sample_rate)
+    hop = int(0.100 * sample_rate)
+    if weighted.size < block:
+        block = weighted.size
+        hop = max(1, block)
+    if block <= 0:
+        return np.zeros(0, dtype=np.float64)
+    count = 1 + max(0, (weighted.size - block) // hop)
+    blocks = np.lib.stride_tricks.as_strided(
+        weighted, shape=(count, block),
+        strides=(weighted.strides[0] * hop, weighted.strides[0]),
+        writeable=False,
+    )
+    return np.mean(np.square(blocks, dtype=np.float64), axis=1)
+
+
+def _sampled_windows(total_samples, sample_rate, window_seconds, coverage):
+    """Evenly-spaced (start, end) sample ranges covering `coverage` of the
+    track. Falls back to the whole track if it's too short to bother."""
+    window = int(window_seconds * sample_rate)
+    if window <= 0 or window >= total_samples:
+        return [(0, total_samples)]
+    n_windows = max(1, int(round((total_samples / window) * coverage)))
+    if n_windows * window >= total_samples:
+        return [(0, total_samples)]
+    starts = sorted(set(
+        int(s) for s in np.linspace(0, total_samples - window, n_windows)))
+    return [(s, s + window) for s in starts]
+
+
 def _measure_lufs(samples, sample_rate):
     """
     Integrated loudness of a mono track, in LUFS - ITU-R BS.1770's formula
@@ -219,22 +265,19 @@ def _measure_lufs(samples, sample_rate):
     """
     if samples.size == 0:
         return -70.0
-    weighted = _k_weight(samples, sample_rate)
-    block = int(0.400 * sample_rate)
-    hop = int(0.100 * sample_rate)
-    if weighted.size < block:
-        block = weighted.size
-        hop = max(1, block)
-    if block <= 0:
-        return -70.0
 
-    count = 1 + max(0, (weighted.size - block) // hop)
-    blocks = np.lib.stride_tricks.as_strided(
-        weighted, shape=(count, block),
-        strides=(weighted.strides[0] * hop, weighted.strides[0]),
-        writeable=False,
-    )
-    mean_sq = np.mean(np.square(blocks, dtype=np.float64), axis=1)
+    duration = samples.size / sample_rate
+    if duration <= _LUFS_FULL_SCAN_SECONDS:
+        mean_sq = _block_mean_squares(_k_weight(samples, sample_rate), sample_rate)
+    else:
+        windows = _sampled_windows(samples.size, sample_rate,
+                                   _LUFS_WINDOW_SECONDS, _LUFS_SAMPLE_COVERAGE)
+        parts = [_block_mean_squares(
+                    _k_weight(np.ascontiguousarray(samples[start:end]), sample_rate),
+                    sample_rate)
+                 for start, end in windows]
+        mean_sq = np.concatenate(parts) if parts else np.zeros(0, dtype=np.float64)
+
     mean_sq = mean_sq[mean_sq > 0]
     if mean_sq.size == 0:
         return -70.0
@@ -293,33 +336,41 @@ def clean_for_analysis(samples, sample_rate, plugin_path=None, log=None):
 
 def _cleaned_cache_path(path):
     stat = os.stat(path)
+    # "clean2" (not "clean") marks the int16 format below - so a cache file
+    # written by an earlier build (float32) is never misread as this one's
+    # format. It just goes unused and ages out via settings.prune_cache.
     key = hashlib.sha1(
-        f"{path}|{stat.st_size}|{stat.st_mtime}|clean|{SAMPLE_RATE}".encode("utf-8")
+        f"{path}|{stat.st_size}|{stat.st_mtime}|clean2|{SAMPLE_RATE}".encode("utf-8")
     ).hexdigest()
     directory = settings.cache_dir()
     os.makedirs(directory, exist_ok=True)
-    return os.path.join(directory, key + ".clean.pcm")
+    return os.path.join(directory, key + ".clean16.pcm")
 
 
 def cleaned_samples_for(path, denoiser_path=None, log=None):
     """
-    `clean_for_analysis`, cached per file (same content-hash pattern as
-    player.decode_to_pcm). Speech detection, auto-mute and the waveform all
-    end up asking for the same speaker's cleaned audio more than once in a
-    session - reopening a project, or redrawing after an edit - and denoising
-    plus compressing an hour of audio is not free.
+    `clean_for_analysis`, cached per file (same content-hash pattern, and the
+    same int16 storage, as player.decode_to_pcm - halves the disk cost of a
+    float32 cache, and _lufs_normalize always leaves headroom below full
+    scale so nothing clips on the way down). Speech detection, auto-mute and
+    the waveform all end up asking for the same speaker's cleaned audio more
+    than once in a session - reopening a project, or redrawing after an edit
+    - and denoising plus compressing an hour of audio is not free.
     """
     cache_path = _cleaned_cache_path(path)
     if os.path.exists(cache_path):
         try:
-            return np.fromfile(cache_path, dtype=np.float32)
+            stored = np.fromfile(cache_path, dtype=np.int16)
+            if stored.size:
+                return stored.astype(np.float32) / 32768.0
         except Exception:
             pass                            # fall through and rebuild it
     samples = _load(path)
     cleaned = clean_for_analysis(samples, SAMPLE_RATE, denoiser_path, log=log)
     cleaned = np.asarray(cleaned, dtype=np.float32)
     try:
-        cleaned.tofile(cache_path)
+        quantized = np.clip(cleaned * 32767.0, -32768, 32767).astype(np.int16)
+        quantized.tofile(cache_path)
     except Exception:
         pass                                # a missed cache write is not fatal
     return cleaned

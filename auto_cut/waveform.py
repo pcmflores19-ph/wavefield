@@ -62,32 +62,6 @@ def extract_peaks(paths, buckets):
     return _peaks_from_samples(samples, buckets)
 
 
-def extract_peaks_per_speaker(paths, duration_seconds, peaks_per_second=PEAKS_PER_SECOND):
-    """
-    One peak array per speaker, each covering the full timeline at a fixed
-    resolution so the UI can stack them as separate lanes (like Resolve's
-    per-track audio) and re-bucket them for any zoom level without re-decoding.
-    """
-    buckets = max(1, int(round(duration_seconds * peaks_per_second)))
-    out = []
-    for path in paths:
-        cmd = [
-            FFMPEG, "-v", "error", "-i", path,
-            "-map", "0:a:0",
-            "-ac", "1", "-ar", str(PEAK_SAMPLE_RATE),
-            "-f", "s16le", "-",
-        ]
-        result = subprocess.run(cmd, capture_output=True)
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"ffmpeg peak extraction failed for {os.path.basename(path)}:\n"
-                f"{result.stderr.decode(errors='replace')}"
-            )
-        samples = np.frombuffer(result.stdout, dtype=np.int16).astype(np.float32) / 32768.0
-        out.append(_peaks_from_samples(samples, buckets))
-    return out
-
-
 def render_preview(paths, keep_ranges, start_seconds, preview_seconds=15.0):
     """
     Renders a short WAV of the EDITED audio (keep ranges concatenated), picking

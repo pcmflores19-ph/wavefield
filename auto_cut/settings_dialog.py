@@ -26,8 +26,8 @@ class SettingsDialog(tk.Toplevel):
         self.log = log
         self.title(f"{version.APP_NAME} - Settings")
         self.configure(background=ui_theme.BG)
-        self.geometry("720x300")
-        self.minsize(600, 260)
+        self.geometry("720x420")
+        self.minsize(600, 380)
         self.transient(parent)
 
         frame = ttk.Frame(self, style="Panel.TFrame")
@@ -75,6 +75,19 @@ class SettingsDialog(tk.Toplevel):
                        "can still check by hand from the Help menu."
                   ).pack(anchor="w", pady=(2, 0))
 
+        ttk.Separator(frame).pack(fill="x", pady=(12, 10))
+        ttk.Label(frame, text="STORAGE", style="PanelDim.TLabel").pack(anchor="w")
+        self.cache_size_label = ttk.Label(frame, style="PanelDim.TLabel",
+                                          justify="left", wraplength=660, text="")
+        self.cache_size_label.pack(anchor="w", pady=(2, 4))
+        ttk.Button(frame, text="Clear cache", width=14,
+                   command=self._clear_cache).pack(anchor="w")
+        ttk.Label(frame, style="PanelDim.TLabel", justify="left", wraplength=660,
+                  text="Decoded audio, cleaned-up analysis copies and transcripts - "
+                       "all rebuilt automatically the next time they're needed. "
+                       "Never your projects or recordings."
+                  ).pack(anchor="w", pady=(2, 0))
+
         self.status = ttk.Label(frame, style="PanelDim.TLabel", justify="left",
                                 wraplength=660, text="")
         self.status.pack(anchor="w", pady=(10, 0))
@@ -92,6 +105,7 @@ class SettingsDialog(tk.Toplevel):
 
         self.bind("<Escape>", lambda e: self.destroy())
         self._describe_current()
+        self._refresh_cache_size()
 
     def _install(self):
         """
@@ -123,6 +137,38 @@ class SettingsDialog(tk.Toplevel):
         self._set_status("Installing WhisperX in the window that just opened. "
                          "It takes 5-15 minutes. When it finishes, press "
                          "'Find it for me' here.")
+
+    def _refresh_cache_size(self):
+        def work():
+            total = 0
+            try:
+                directory = settings.cache_dir()
+                if os.path.isdir(directory):
+                    for name in os.listdir(directory):
+                        path = os.path.join(directory, name)
+                        if os.path.isfile(path):
+                            total += os.path.getsize(path)
+            except Exception:
+                pass                 # a size we couldn't compute just shows as 0
+            mb = total / 1e6
+            text = f"Currently using {mb:.0f} MB." if mb >= 1 else "Currently empty."
+            self.after(0, lambda: self.cache_size_label.config(text=text))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _clear_cache(self):
+        def work():
+            try:
+                removed, freed, skipped = settings.clear_cache()
+            except Exception as exc:
+                self._set_status(f"Could not clear the cache: {exc}")
+                return
+            note = (f" ({skipped} file(s) still in use were left alone.)"
+                    if skipped else "")
+            self._set_status(f"Cleared {removed} file(s), {freed/1e6:.0f} MB "
+                             f"freed.{note} Everything rebuilds automatically "
+                             "the next time it's needed.")
+            self._refresh_cache_size()
+        threading.Thread(target=work, daemon=True).start()
 
     # ---------------------------------------------------------------- helpers
 
