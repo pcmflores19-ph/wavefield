@@ -1240,9 +1240,12 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
                                              top + LANE_HEIGHT - 1,
                                              fill="#3a3a52", outline="#6a6a92", stipple="gray50")
 
+            self._draw_lane_axis(mid, half)
+
+            # On the right, out of the way of the axis labels on the left.
             label = self.audio_track_name(lane_i)
-            self.canvas.create_text(6, top + 8, text=label, fill=color, anchor="w",
-                                    font=("TkDefaultFont", 7, "bold"))
+            self.canvas.create_text(width - 6, top + 8, text=label, fill=color,
+                                    anchor="e", font=("TkDefaultFont", 7, "bold"))
 
         # Current drag selection, drawn over everything.
         if self.selection:
@@ -1390,6 +1393,22 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
         self.view_start = 0.0
         self.view_span = self.timeline_duration
         self._draw_waveform()
+
+    def _draw_lane_axis(self, mid, half):
+        """
+        The lane's y axis: ticks at the top, quarters and centre, labelled with
+        the amplitude each one actually represents. The labels follow the
+        Height zoom - at x8 the ceiling is 0.13, not 1.0 - so a magnified lane
+        can always be read for what it is.
+        """
+        gain = self.waveform_gain
+        for fraction in (1.0, 0.5, 0.0, -0.5, -1.0):
+            y = mid - fraction * half
+            self.canvas.create_line(0, y, 4, y, fill="#666")
+            value = fraction / gain
+            text = "0" if fraction == 0 else f"{value:+.2f}".rstrip("0").rstrip(".")
+            self.canvas.create_text(6, y, text=text, fill="#888", anchor="w",
+                                    font=("TkDefaultFont", 6))
 
     def _zoom_waveform(self, factor):
         """

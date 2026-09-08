@@ -122,7 +122,7 @@ def denoise(samples, plugin_path, log=None):
     chain = vst_host.TrackChain()
     try:
         chain.add("rnnoise", plugin_path)
-        return chain.process(samples, SAMPLE_RATE, reset=True)
+        return chain.process(samples, SAMPLE_RATE, reset=True, log=log)
     except Exception as exc:
         if log:
             log(f"  rnnoise unavailable ({exc}); detecting on the raw waveform")

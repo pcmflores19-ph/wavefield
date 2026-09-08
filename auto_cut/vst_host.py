@@ -19,7 +19,14 @@ import sys
 import tempfile
 import threading
 
+import numpy
+
 import bundled
+
+# How much audio a plugin gets at a time when it could not manage the whole
+# track at once. Long enough that the joins are rare, short enough that any
+# plugin's declared maximum block size is comfortably clear.
+CHUNK_SECONDS = 30.0
 
 def _default_search_dirs():
     """
@@ -370,7 +377,7 @@ class TrackChain:
             return []
         return [s for s in self.slots if not s.bypassed]
 
-    def process(self, audio, sample_rate, reset=False):
+    def process(self, audio, sample_rate, reset=False, log=None):
         """
         Runs mono float32 `audio` (1-D) through the chain in ONE pass. Returns
         the processed array; on any plugin error the input is passed through
@@ -383,6 +390,15 @@ class TrackChain:
         pair) come back misaligned at every block boundary, which would make the
         export sound different from the single pass. Correct audio wins; the
         callers instead make sure offline work never overlaps playback.
+
+        A plugin that cannot manage a whole episode in one call (an hour is
+        ~600 MB of float32, and plugins declare a maximum block size) falls
+        back to chunks for that plugin only, rather than being skipped. Being
+        skipped is what used to happen, silently: the waveform simply did not
+        change and an export quietly came out with none of the effects on it.
+
+        `log` is how any of that gets said out loud. Playback passes nothing -
+        the audio callback must not log per block.
         """
         slots = self.active_slots()
         if not slots:
@@ -397,10 +413,52 @@ class TrackChain:
                             buf = slot.process(
                                 buf.reshape(-1), sample_rate).reshape(1, -1)
                         else:
-                            buf = slot.plugin(buf, sample_rate, reset=reset)
-                except Exception:
+                            buf = self._run_plugin(slot, buf, sample_rate,
+                                                   reset, log)
+                except Exception as exc:
+                    if log:
+                        log(f"  {slot.name}: could not process this audio "
+                            f"({exc}) - it is NOT applied here")
                     continue
         return buf.reshape(-1)
+
+    @staticmethod
+    def _run_plugin(slot, buf, sample_rate, reset, log):
+        """
+        One plugin over `buf`, whole if it can manage it and in chunks if it
+        cannot. Any length change (latency compensation) is corrected here, so
+        a caller never has to decide whether to throw the result away.
+        """
+        length = buf.shape[1]
+        try:
+            out = slot.plugin(buf, sample_rate, reset=reset)
+        except Exception as exc:
+            if log:
+                log(f"  {slot.name}: {exc}; retrying in chunks")
+            pieces = []
+            step = int(sample_rate * CHUNK_SECONDS)
+            # reset only on the first chunk: the plugin's state has to carry
+            # across the joins or every boundary becomes a click.
+            for index, offset in enumerate(range(0, length, step)):
+                piece = buf[:, offset:offset + step]
+                pieces.append(slot.plugin(piece, sample_rate,
+                                          reset=(reset and index == 0)))
+            out = numpy.concatenate(pieces, axis=1) if pieces else buf
+            if log:
+                log(f"  {slot.name}: applied in chunks")
+
+        if out.shape[1] != length:
+            # Latency-compensating plugins hand back a different length. Line
+            # it back up instead of discarding the whole pass, which is what
+            # the callers used to do - silently.
+            if log:
+                log(f"  {slot.name}: returned {out.shape[1]} samples for "
+                    f"{length}; aligning")
+            if out.shape[1] > length:
+                out = out[:, :length]
+            else:
+                out = numpy.pad(out, ((0, 0), (0, length - out.shape[1])))
+        return out
 
     def snapshot(self, log=None):
         """

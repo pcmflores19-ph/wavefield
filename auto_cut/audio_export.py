@@ -69,10 +69,18 @@ def render_track(path, keep_ranges, mute_ranges=None, chain=None, gain=1.0,
             progress(f"processing {os.path.basename(path)} through {chain.describe()}")
         # Detached copy - see TrackChain.snapshot(). Rendering through the live
         # plugins while playback is running crashes the process.
-        offline = chain.snapshot()
-        processed = offline.process(audio, SAMPLE_RATE, reset=True)
+        offline = chain.snapshot(log=progress)
+        processed = offline.process(audio, SAMPLE_RATE, reset=True,
+                                    log=progress)
         if processed.size == audio.size:
             audio = processed
+        elif progress:
+            # process() already lines lengths back up, so this should not
+            # happen - but an export quietly containing none of the effects is
+            # exactly the failure this whole path used to have, so say so.
+            progress(f"WARNING: {os.path.basename(path)} came back "
+                     f"{processed.size} samples for {audio.size}; the effects "
+                     "chain was NOT applied to this track")
 
     # Ramp into and out of every mute. Cutting straight to zero puts a step
     # in the waveform, and a step is a click - audible on every single mute,

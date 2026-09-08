@@ -144,7 +144,7 @@ def processed_peaks(path, chain, duration_seconds, log=None,
         # pushing an hour of audio through it from here would stall the audio
         # thread and drive the same VST from two threads at once.
         offline = chain.snapshot(log=log)
-        processed = offline.process(samples, SAMPLE_RATE, reset=True)
+        processed = offline.process(samples, SAMPLE_RATE, reset=True, log=log)
         if processed.size == samples.size:
             samples = processed
 
