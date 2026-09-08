@@ -86,9 +86,9 @@ def render_track(path, keep_ranges, mute_ranges=None, chain=None, gain=1.0,
         # A short mute must not fade for longer than it lasts.
         span = min(fade, (b - a) // 2) or 1
         audio[a:a + span] *= np.linspace(1.0, 0.0, span, dtype=np.float32)
-        audio[a + span:b - span] = 0.0
         if b - span > a + span:
-            audio[b - span:b] *= np.linspace(0.0, 1.0, span, dtype=np.float32)
+            audio[a + span:b - span] = 0.0
+        audio[b - span:b] *= np.linspace(0.0, 1.0, span, dtype=np.float32)
 
     if gain != 1.0:
         audio *= gain

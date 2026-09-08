@@ -421,6 +421,9 @@ class FxDialog(tk.Toplevel):
         if i is None:
             return
         slot = self.chain.slots[i]
+        if getattr(slot, "is_native", False):
+            self._show_params()
+            return
 
         def done():
             self.log(f"{slot.name}: settings applied.")

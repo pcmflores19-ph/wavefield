@@ -423,14 +423,15 @@ class TrackChain:
         copy = TrackChain()
         copy.enabled = self.enabled
 
+        resolved_slots = []
         wanted = []
-        for slot in list(self.slots):
+        for orig_idx, slot in enumerate(list(self.slots)):
             if slot.bypassed:
                 continue                      # nothing to reproduce
             if getattr(slot, "is_native", False):
                 # Nothing to load and nothing shared - just take a copy and
                 # keep its position in the chain.
-                copy.slots.append((len(copy.slots), slot.copy()))
+                resolved_slots.append((orig_idx, slot.copy()))
                 continue
             try:
                 with slot.lock:
@@ -439,16 +440,12 @@ class TrackChain:
                 if log:
                     log(f"{slot.name}: could not read state ({exc})")
                 continue
-            wanted.append((slot.name, slot.path, state))
+            wanted.append((orig_idx, slot.name, slot.path, state))
 
         # Phase 2: load the copies. One lock acquisition per plugin rather than
         # one for the whole chain, so a playing audio thread waits for a single
         # load at worst instead of the entire set.
-        # Native slots were appended above as (position, slot) pairs; unwrap
-        # them now that the ordering is settled.
-        copy.slots = [entry[1] if isinstance(entry, tuple) else entry
-                      for entry in copy.slots]
-        for name, path, state in wanted:
+        for orig_idx, name, path, state in wanted:
             try:
                 with _GATE.loading():
                     plugin = pedalboard.load_plugin(path)
@@ -457,7 +454,10 @@ class TrackChain:
                 if log:
                     log(f"{name}: could not copy for offline use ({exc})")
                 continue
-            copy.slots.append(PluginSlot(name, path, plugin))
+            resolved_slots.append((orig_idx, PluginSlot(name, path, plugin)))
+
+        resolved_slots.sort(key=lambda s: s[0])
+        copy.slots = [slot for _, slot in resolved_slots]
         return copy
 
     def describe(self):

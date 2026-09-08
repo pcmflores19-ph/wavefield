@@ -178,9 +178,30 @@ def apply_scene_edits(scenes, edits):
         if end <= start:
             continue
         if camera is None:
-            continue           # automatic already sits underneath
-        result = _assign(result, int(camera), float(start), float(end))
+            result = _restore_automatic(result, scenes, float(start), float(end))
+        else:
+            result = _assign(result, int(camera), float(start), float(end))
     return _merge_runs(result)
+
+
+def _restore_automatic(current, base_scenes, start, end):
+    """Replaces [start, end) in current with whatever was in base_scenes."""
+    out = []
+    for existing, a, b in current:
+        if b <= start or a >= end:
+            out.append((existing, a, b))
+            continue
+        if a < start:
+            out.append((existing, a, start))
+        if b > end:
+            out.append((existing, end, b))
+    for auto_cam, a, b in base_scenes:
+        oa = max(a, start)
+        ob = min(b, end)
+        if ob > oa:
+            out.append((auto_cam, oa, ob))
+    out.sort(key=lambda s: s[1])
+    return out
 
 
 def _assign(scenes, camera, start, end):

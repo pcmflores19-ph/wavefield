@@ -2392,6 +2392,7 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
                             "Wrote:\n" + "\n".join(written) + note)
 
     def _export_audio_failed(self, exc):
+        self._end_modal_export()
         self.progress.stop()
         self._set_export_enabled(True)
         messagebox.showerror("Export failed", str(exc))

@@ -70,9 +70,19 @@ def probe(path):
                          has_audio, audio_channels=audio_channels)
 
     # r_frame_rate is the real (not average) rate, e.g. "30000/1001"
-    fps = Fraction(video.get("r_frame_rate", "30/1"))
-    if fps <= 0:
-        raise RuntimeError(f"Could not determine frame rate for {path}")
+    fps = None
+    for key in ("r_frame_rate", "avg_frame_rate"):
+        raw = video.get(key)
+        if raw and raw != "0/0":
+            try:
+                candidate = Fraction(raw)
+                if candidate > 0:
+                    fps = candidate
+                    break
+            except (ZeroDivisionError, ValueError):
+                pass
+    if fps is None or fps <= 0:
+        fps = Fraction(30, 1)
 
     width = int(video.get("width", 1920))
     height = int(video.get("height", 1080))

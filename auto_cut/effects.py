@@ -102,12 +102,13 @@ def noise_gate(samples, sample_rate, open_threshold_db=-26.0,
 
     for i in range(samples.size):
         current = abs(float(samples[i]))
-        if current > open_level and not is_open:
+        if current > open_level:
             is_open = True
+        level = max(level, current)
         if level < close_level and is_open:
             held = 0.0
             is_open = False
-        level = max(level, current) - decay_rate
+        level = max(0.0, level - decay_rate)
 
         if is_open:
             attenuation = min(1.0, attenuation + attack_rate)
