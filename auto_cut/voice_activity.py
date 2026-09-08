@@ -7,33 +7,37 @@ It also made the cuts only as good as the transcript: a misheard Taglish phrase
 or a dropped word moved the edit. The waveform already knows where speech is,
 and it knows immediately.
 
-The analysis chain, per track:
+The analysis chain, per track (see `clean_for_analysis`):
 
-  1. NORMALIZE - the recordings come from different rooms, mics and Meet
-     sessions, so one speaker's silence can sit louder than another's speech.
-     Levelling them first means a single threshold means the same thing on
-     every track.
-  2. DENOISE with rnnoise - room tone, fan noise and laptop hum are what a
+  1. DENOISE with rnnoise - room tone, fan noise and laptop hum are what a
      plain energy gate mistakes for talking. Stripping them makes the gap
      between speech and silence wide and obvious.
-  3. THRESHOLD - an adaptive gate with hysteresis over short frames.
+  2. COMPRESS - a real compressor, threshold set from that track's own 80th
+     percentile of frame level so it adapts to how the person happened to be
+     recorded, ratio 3:1.
+  3. LOUDNESS-NORMALIZE to -14 LUFS, so every recording ends up levelled the
+     same way regardless of room, mic or Meet session.
+  4. THRESHOLD - an adaptive gate with hysteresis over short frames.
 
-Steps 1 and 2 exist ONLY to make the decision. Nothing here is baked into the
-track: what comes back is a list of time ranges. The audio you hear, edit and
-export is untouched by any of it - the user's own VST chain remains the only
-thing that ever changes the sound.
+Steps 1-3 exist ONLY to make the decision (and to draw the waveform - see
+`clean_for_analysis`'s callers in app.py and waveform.py). Nothing here is
+baked into the track: what comes back is a list of time ranges, or a throwaway
+processed copy for display. The audio you hear, edit and export is untouched
+by any of it - the user's own VST chain remains the only thing that ever
+changes the sound.
 """
+
+import hashlib
+import os
 
 import numpy as np
 
+import effects
+import settings
 from player import SAMPLE_RATE, decode_to_pcm
 
 FRAME_SECONDS = 0.020        # 20ms frames, 10ms hop - fine enough to catch
 HOP_SECONDS = 0.010          # word boundaries without chasing every glottal stop
-
-# Speech is normalized to this RMS before thresholding. Well below full scale,
-# so the loud moments have headroom and nothing clips into the denoiser.
-TARGET_RMS = 0.12
 
 # Where the gate sits between the measured noise floor and the measured speech
 # level. 0.30 puts it nearer the floor, which is right after denoising: the
@@ -96,28 +100,6 @@ def _frame_levels(samples):
     return 20.0 * np.log10(np.maximum(rms, 1e-9)), HOP_SECONDS
 
 
-def normalize(samples):
-    """
-    Scales the track so its speech sits at TARGET_RMS.
-
-    The level is taken from the 95th percentile of frame energy rather than the
-    overall RMS: most of a podcast track is one person NOT talking, so overall
-    RMS mostly measures how quiet their room is, and normalizing by it would
-    amplify the quietest recording the most - exactly backwards.
-    """
-    levels_db, _ = _frame_levels(samples)
-    if levels_db.size == 0:
-        return samples
-    speech_db = float(np.percentile(levels_db, 95))
-    speech_rms = 10.0 ** (speech_db / 20.0)
-    if speech_rms <= 1e-6:
-        return samples
-    gain = TARGET_RMS / speech_rms
-    peak = float(np.abs(samples).max()) or 1.0
-    gain = min(gain, 0.99 / peak)          # headroom for the denoiser
-    return samples * np.float32(gain)
-
-
 def find_denoiser(plugins=None):
     """The rnnoise VST3 path, or None if it isn't installed on this machine."""
     if plugins is None:
@@ -145,6 +127,202 @@ def denoise(samples, plugin_path, log=None):
         if log:
             log(f"  rnnoise unavailable ({exc}); detecting on the raw waveform")
         return samples
+
+
+# ------------------------------------------------------- loudness (K-weighting)
+#
+# A hand-rolled approximation of ITU-R BS.1770's loudness meter: the same two
+# cascaded filters (a high-shelf "pre-filter" standing in for the head, then a
+# high-pass "RLB" filter), designed here from the standard's published analog
+# parameters via the RBJ Audio EQ Cookbook's biquad formulas, rather than
+# copying the spec's fixed 48kHz coefficient table - this way it is correct at
+# whatever SAMPLE_RATE the app actually decodes to.
+#
+# This is a good-faith implementation for deciding an internal gain, not a
+# certified loudness meter: the number it produces is never shown or exported,
+# only used to level a throwaway analysis copy. The two-stage gating below
+# (absolute, then relative) is real BS.1770 gating, not a simplification -
+# skipping it would badly overstate the loudness of a track that is mostly one
+# person's silence while the other speaks, which is the normal shape of a
+# per-speaker podcast recording.
+
+_SHELF_F0, _SHELF_DB, _SHELF_Q = 1681.9744509555319, 3.99984385397, 0.7071752369554193
+_HPF_F0, _HPF_Q = 38.13547087613982, 0.5003270373238773
+
+
+def _high_shelf_coeffs(f0, db_gain, q, sample_rate):
+    a = 10.0 ** (db_gain / 40.0)
+    w0 = 2.0 * np.pi * f0 / sample_rate
+    alpha = np.sin(w0) / (2.0 * q)
+    cos_w0 = np.cos(w0)
+    sqrt_a = np.sqrt(a)
+    b0 = a * ((a + 1) + (a - 1) * cos_w0 + 2 * sqrt_a * alpha)
+    b1 = -2 * a * ((a - 1) + (a + 1) * cos_w0)
+    b2 = a * ((a + 1) + (a - 1) * cos_w0 - 2 * sqrt_a * alpha)
+    a0 = (a + 1) - (a - 1) * cos_w0 + 2 * sqrt_a * alpha
+    a1 = 2 * ((a - 1) - (a + 1) * cos_w0)
+    a2 = (a + 1) - (a - 1) * cos_w0 - 2 * sqrt_a * alpha
+    return (b0 / a0, b1 / a0, b2 / a0, a1 / a0, a2 / a0)
+
+
+def _high_pass_coeffs(f0, q, sample_rate):
+    w0 = 2.0 * np.pi * f0 / sample_rate
+    alpha = np.sin(w0) / (2.0 * q)
+    cos_w0 = np.cos(w0)
+    b0 = (1 + cos_w0) / 2
+    b1 = -(1 + cos_w0)
+    b2 = (1 + cos_w0) / 2
+    a0 = 1 + alpha
+    a1 = -2 * cos_w0
+    a2 = 1 - alpha
+    return (b0 / a0, b1 / a0, b2 / a0, a1 / a0, a2 / a0)
+
+
+def _biquad(samples, b0, b1, b2, a1, a2):
+    """Direct-form-I biquad, sample by sample - genuinely sequential, as
+    effects._envelope is."""
+    out = np.empty_like(samples)
+    x1 = x2 = y1 = y2 = 0.0
+    for i in range(samples.size):
+        x0 = samples[i]
+        y0 = b0 * x0 + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2
+        out[i] = y0
+        x2 = x1
+        x1 = x0
+        y2 = y1
+        y1 = y0
+    return out
+
+
+try:                                    # same optional speedup as effects.py
+    from numba import njit
+    _biquad = njit(cache=True, fastmath=True)(_biquad)
+except Exception:
+    pass
+
+
+def _k_weight(samples, sample_rate):
+    shelf = _high_shelf_coeffs(_SHELF_F0, _SHELF_DB, _SHELF_Q, sample_rate)
+    hpf = _high_pass_coeffs(_HPF_F0, _HPF_Q, sample_rate)
+    stage1 = _biquad(samples.astype(np.float32), *shelf)
+    return _biquad(stage1, *hpf)
+
+
+def _measure_lufs(samples, sample_rate):
+    """
+    Integrated loudness of a mono track, in LUFS - ITU-R BS.1770's formula
+    (-0.691 + 10*log10(mean square)) over 400ms blocks on a 100ms hop, with
+    the standard's two-stage gating: blocks quieter than -70 LUFS are dropped
+    outright (that is analogue noise floor, not programme), then blocks more
+    than 10 LU below the loudness of what's left are dropped too, so long
+    stretches of one speaker's silence don't drag the estimate down.
+    """
+    if samples.size == 0:
+        return -70.0
+    weighted = _k_weight(samples, sample_rate)
+    block = int(0.400 * sample_rate)
+    hop = int(0.100 * sample_rate)
+    if weighted.size < block:
+        block = weighted.size
+        hop = max(1, block)
+    if block <= 0:
+        return -70.0
+
+    count = 1 + max(0, (weighted.size - block) // hop)
+    blocks = np.lib.stride_tricks.as_strided(
+        weighted, shape=(count, block),
+        strides=(weighted.strides[0] * hop, weighted.strides[0]),
+        writeable=False,
+    )
+    mean_sq = np.mean(np.square(blocks, dtype=np.float64), axis=1)
+    mean_sq = mean_sq[mean_sq > 0]
+    if mean_sq.size == 0:
+        return -70.0
+    block_loudness = -0.691 + 10.0 * np.log10(mean_sq)
+
+    absolute_gated = mean_sq[block_loudness >= -70.0]
+    if absolute_gated.size == 0:
+        return -70.0
+    relative_threshold = -0.691 + 10.0 * np.log10(np.mean(absolute_gated)) - 10.0
+    relative_gated = mean_sq[
+        (block_loudness >= -70.0) & (block_loudness >= relative_threshold)]
+    if relative_gated.size == 0:
+        relative_gated = absolute_gated
+    return float(-0.691 + 10.0 * np.log10(np.mean(relative_gated)))
+
+
+def _lufs_normalize(samples, sample_rate, target_lufs=-14.0):
+    """Gains `samples` so its integrated loudness reaches `target_lufs`."""
+    current = _measure_lufs(samples, sample_rate)
+    if current <= -69.0:              # nothing there worth levelling
+        return samples
+    gain = 10.0 ** ((target_lufs - current) / 20.0)
+    peak = float(np.abs(samples).max()) or 1.0
+    gain = min(gain, 0.99 / peak)      # never clip chasing a loud target
+    return samples * np.float32(gain)
+
+
+def _percentile_threshold_db(levels_db, percentile=80.0):
+    """A compressor threshold that adapts to how this track was recorded,
+    rather than a fixed dB number."""
+    if levels_db.size == 0:
+        return -20.0
+    return float(np.percentile(levels_db, percentile))
+
+
+def clean_for_analysis(samples, sample_rate, plugin_path=None, log=None):
+    """
+    Denoise -> compress -> loudness-normalize: one clean, comparable copy of
+    a track, shared by speech detection, auto-mute, and the on-screen
+    waveform, so what you see matches what the app decided.
+
+    Never touches the file or the audio the app plays and exports - see the
+    module docstring.
+    """
+    work = samples
+    if plugin_path:
+        work = denoise(work, plugin_path, log=log)
+
+    levels_db, _ = _frame_levels(work)
+    threshold_db = _percentile_threshold_db(levels_db, 80.0)
+    work = effects.compressor(work, sample_rate, threshold_db=threshold_db,
+                              ratio=3.0)
+
+    return _lufs_normalize(work, sample_rate, target_lufs=-14.0)
+
+
+def _cleaned_cache_path(path):
+    stat = os.stat(path)
+    key = hashlib.sha1(
+        f"{path}|{stat.st_size}|{stat.st_mtime}|clean|{SAMPLE_RATE}".encode("utf-8")
+    ).hexdigest()
+    directory = settings.cache_dir()
+    os.makedirs(directory, exist_ok=True)
+    return os.path.join(directory, key + ".clean.pcm")
+
+
+def cleaned_samples_for(path, denoiser_path=None, log=None):
+    """
+    `clean_for_analysis`, cached per file (same content-hash pattern as
+    player.decode_to_pcm). Speech detection, auto-mute and the waveform all
+    end up asking for the same speaker's cleaned audio more than once in a
+    session - reopening a project, or redrawing after an edit - and denoising
+    plus compressing an hour of audio is not free.
+    """
+    cache_path = _cleaned_cache_path(path)
+    if os.path.exists(cache_path):
+        try:
+            return np.fromfile(cache_path, dtype=np.float32)
+        except Exception:
+            pass                            # fall through and rebuild it
+    samples = _load(path)
+    cleaned = clean_for_analysis(samples, SAMPLE_RATE, denoiser_path, log=log)
+    cleaned = np.asarray(cleaned, dtype=np.float32)
+    try:
+        cleaned.tofile(cache_path)
+    except Exception:
+        pass                                # a missed cache write is not fatal
+    return cleaned
 
 
 def _gate(levels_db, hop_seconds):
@@ -195,7 +373,7 @@ def _merge_close(intervals, max_gap):
 
 
 def speaking_intervals(path, denoiser_path=None, duration=None, log=None,
-                       with_levels=False):
+                       with_levels=False, with_samples=False):
     """
     Returns (start, end) ranges where this speaker is talking, found from the
     waveform. `denoiser_path` is rnnoise; without it the gate still works, just
@@ -206,34 +384,26 @@ def speaking_intervals(path, denoiser_path=None, duration=None, log=None,
     another - deciding who is talking from a single microphone in isolation
     cannot tell a real voice from the other person bleeding into it.
 
-    Neither the normalization nor the denoising touches the file or the audio
-    the app plays and exports - they shape a throwaway copy used to decide.
+    With `with_samples=True` the cleaned copy (see `clean_for_analysis`) comes
+    back too, so a caller that also wants to draw the waveform from it - see
+    app.py - doesn't have to decode and clean the file a second time.
+
+    None of this touches the file or the audio the app plays and exports - it
+    shapes a throwaway copy used to decide. Deliberately quiet: only genuine
+    problems (like rnnoise being unavailable) reach `log`.
     """
-    import os
-    name = os.path.basename(path)
-    if log:
-        log(f"  {name}: reading waveform")
-    samples = _load(path)
-
-    if log:
-        log(f"  {name}: normalizing for analysis")
-    work = normalize(samples)
-
-    if denoiser_path:
-        if log:
-            log(f"  {name}: denoising for analysis (not baked in)")
-        work = denoise(work, denoiser_path, log=log)
+    work = cleaned_samples_for(path, denoiser_path, log=log)
 
     levels_db, hop = _frame_levels(work)
-    intervals, floor_db, gate_db = _gate(levels_db, hop)
+    intervals, _floor_db, _gate_db = _gate(levels_db, hop)
 
     if duration:
         intervals = [(max(0.0, s), min(duration, e)) for s, e in intervals
                      if s < duration]
-    talk = sum(e - s for s, e in intervals)
-    if log:
-        log(f"  {name}: noise floor {floor_db:.1f} dB, gate {gate_db:.1f} dB, "
-            f"{len(intervals)} speech regions, {talk:.0f}s of speech")
+
+    result = [intervals]
     if with_levels:
-        return intervals, levels_db, hop
-    return intervals
+        result += [levels_db, hop]
+    if with_samples:
+        result.append(work)
+    return result[0] if len(result) == 1 else tuple(result)

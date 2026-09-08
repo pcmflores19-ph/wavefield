@@ -40,7 +40,7 @@ from silence_detector import (aggressiveness_to_min_gap, apply_mute_edits,
                               compute_auto_mutes_from_intervals,
                               compute_keep_ranges_from_intervals, summarize)
 import voice_activity
-from waveform import extract_peaks_per_speaker, processed_peaks
+from waveform import PEAKS_PER_SECOND, peaks_from_samples, processed_peaks
 from whisperx_runner import language_label, model_label, transcribe
 
 LANE_HEIGHT = 74             # per-speaker waveform lane
@@ -460,35 +460,33 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
             duration = max(m.duration_seconds for m in media)
 
             denoiser = voice_activity.find_denoiser()
-            if denoiser:
-                self.log("Detecting speech (normalize -> rnnoise -> gate). "
-                         "Both are analysis only - your audio is not altered.")
-            else:
-                # Only reachable when running from source without rnnoise
-                # installed; a built copy ships it.
-                self.log("Detecting speech. rnnoise was not found, so the gate "
-                         "runs on the raw waveform; expect it to be less exact "
-                         "on a noisy room.")
+            self.log("Analyzing waveforms")
 
+            # The waveform you see, the cuts, and auto-mute all come from the
+            # same cleaned-up copy of each track (see
+            # voice_activity.clean_for_analysis) - denoised and levelled for
+            # analysis only, never baked into the audio you hear or export.
+            buckets = max(1, int(round(duration * PEAKS_PER_SECOND)))
             saved = getattr(self, "_saved_speech", None)
             levels_per_speaker = []
+            peaks_list = []
             hop = None
             if saved and len(saved) == len(self.speaker_paths):
-                self.log("  reusing the speech detected when this project was "
-                         "saved (the recordings have not changed)")
                 speech_per_speaker = saved
+                for path in self.speaker_paths:
+                    cleaned = voice_activity.cleaned_samples_for(
+                        path, denoiser, log=self.log)
+                    peaks_list.append(peaks_from_samples(cleaned, buckets))
             else:
                 speech_per_speaker = []
                 for path in self.speaker_paths:
-                    intervals, levels, hop = voice_activity.speaking_intervals(
+                    intervals, levels, hop, cleaned = voice_activity.speaking_intervals(
                         path, denoiser, duration=duration, log=self.log,
-                        with_levels=True)
+                        with_levels=True, with_samples=True)
                     speech_per_speaker.append(intervals)
                     levels_per_speaker.append(levels)
+                    peaks_list.append(peaks_from_samples(cleaned, buckets))
             self._saved_speech = None
-
-            self.log("Reading waveforms ...")
-            peaks_list = extract_peaks_per_speaker(self.speaker_paths, duration)
 
             self.log("Preparing audio for playback ...")
             self.player.load(self.speaker_paths)
