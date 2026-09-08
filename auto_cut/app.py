@@ -460,6 +460,10 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
             duration = max(m.duration_seconds for m in media)
 
             denoiser = voice_activity.find_denoiser()
+            # Stashed for _peaks_worker, which redraws through the effects
+            # chain later and needs to start from the same cleaned baseline -
+            # otherwise the waveform jumps the moment the chain is touched.
+            self._denoiser = denoiser
             self.log("Analyzing waveforms")
 
             # The waveform you see, the cuts, and auto-mute all come from the
@@ -1851,7 +1855,9 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
             for index, path in enumerate(self.speaker_paths):
                 chain = (self.track_chains[index]
                          if index < len(self.track_chains) else None)
-                updated.append(processed_peaks(path, chain, self.timeline_duration))
+                updated.append(processed_peaks(
+                    path, chain, self.timeline_duration,
+                    denoiser_path=getattr(self, "_denoiser", None)))
             self.root.after(0, lambda: self._peaks_refreshed(updated))
         except Exception as exc:
             self.log(f"Could not redraw the waveform through the effects: {exc}")

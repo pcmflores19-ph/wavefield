@@ -144,22 +144,25 @@ def peaks_from_samples(samples, buckets):
     return _peaks_from_samples(samples, buckets)
 
 
-def processed_peaks(path, chain, duration_seconds,
+def processed_peaks(path, chain, duration_seconds, denoiser_path=None,
                     peaks_per_second=PEAKS_PER_SECOND):
     """
     Peaks for one speaker AFTER their VST chain, so the drawn waveform matches
     what you actually hear.
 
-    Reuses the decoded PCM the player already caches, so this costs a chain
-    pass rather than another decode. A denoiser or leveler changes the shape of
-    the wave visibly, and without this the display keeps showing the raw file.
+    Starts from the same cleaned-for-analysis baseline the waveform is drawn
+    from right after Analyze (see voice_activity.cleaned_samples_for) rather
+    than the raw file - otherwise the picture visibly jumps the moment you
+    touch the effects chain, as if the analysis cleanup had switched off. It's
+    disk-cached from the Analyze step, so this costs a chain pass, not another
+    decode-and-clean. Nothing here is baked into the audio you hear or export
+    - only the display.
     """
     import numpy as np
-    from player import SAMPLE_RATE, decode_to_pcm
+    from player import SAMPLE_RATE
+    from voice_activity import cleaned_samples_for
 
-    pcm_path = decode_to_pcm(path)
-    samples = np.asarray(np.memmap(pcm_path, dtype=np.int16, mode="r"),
-                         dtype=np.float32) / 32768.0
+    samples = cleaned_samples_for(path, denoiser_path)
 
     if chain is not None and chain.active_slots():
         # A detached copy: the live chain belongs to the audio callback, and
