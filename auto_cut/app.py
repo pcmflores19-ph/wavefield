@@ -30,12 +30,12 @@ import version
 import vst_host
 from app_actions import ActionsMixin
 from app_ui import UIBuilderMixin
-from audio_export import decode_audio_file, export_audio
+from audio_export import bake_processed_media, decode_audio_file, export_audio
 from fcpxml_writer import write_fcpxml
 from transcript_export import export_alongside
 from fx_dialog import FxDialog
 from media_probe import probe
-from player import SAMPLE_RATE as PLAYER_SAMPLE_RATE, Player
+from player import SAMPLE_RATE as PLAYER_SAMPLE_RATE, Player, decoded_duration_seconds
 from silence_detector import (aggressiveness_to_min_gap, apply_mute_edits,
                               compute_auto_mutes_from_intervals,
                               compute_keep_ranges_from_intervals, summarize)
@@ -75,13 +75,15 @@ METER_FLOOR_DB = -60.0       # bottom of the meter scale
 METER_DECAY = 0.25           # how fast the bar falls back per UI tick
 PEAK_HOLD_TICKS = 18         # how long the peak marker sticks before dropping
 
+FADER_MAX_DB = 12.0          # top of the mixer gain fader (shares the floor with the meters)
+
 # Classic three-zone level meter: green while there's headroom, yellow as it
 # gets loud, red where clipping is a real risk.
 METER_GREEN_MAX_DB = -12.0
 METER_YELLOW_MAX_DB = -3.0
-METER_GREEN = "#3fbf6f"
-METER_YELLOW = "#e8c341"
-METER_RED = "#e0503f"
+METER_GREEN = "#4caf50"       # Material Design green/amber/red 500 - the
+METER_YELLOW = "#ffc107"      # recognizable "default" traffic-light shades,
+METER_RED = "#f44336"         # picked for max contrast against the meter's near-black bar
 METER_SCALE_TICKS = (0, -6, -12, -24, -40)
 
 LANE_COLORS = ["#57b9a6", "#c9a227", "#7a9ec2", "#c07ab8", "#9ec27a"]
@@ -94,6 +96,7 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
         self._set_window_icon(root)
         root.geometry("1280x860")
         root.minsize(1024, 700)
+        root.state("zoomed")
 
         self.speaker_paths = []
         self.speaker_media = []
@@ -101,10 +104,22 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
         self._saved_speech = None        # speech carried in from an opened project
         self._speech_levels = None       # per-frame dB per lane
         self._speech_hop = None
+        # Per-path analysis results, so removing one track (or adding
+        # another to an already-analyzed set) doesn't re-decode and re-run
+        # VAD on tracks that didn't change - keyed by path rather than list
+        # index so it survives reordering and removal untouched. Not
+        # cleared by _invalidate_analysis; only new_project() starts fresh.
+        self._analysis_cache = {}
         self.per_speaker_speech = None   # (start, end) speech, measured from the waveform
         self.timeline_duration = 0.0
         self.peaks_list = []
+        # Each speaker's REAL decoded-audio duration (player.decoded_duration_seconds),
+        # parallel to speaker_media - used for peak generation and waveform pixel
+        # scaling instead of media_probe's ffprobe-derived duration_seconds, which
+        # can disagree with the actual decoded length and shift the waveform.
+        self._audio_durations = []
         self.playhead = None
+        self._playhead_line_id = None  # canvas item, moved in place during playback
         self.view_start = 0.0
         self.view_span = 0.0
         # Vertical magnification of the drawn waveform only. The peaks
@@ -140,8 +155,10 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
         self.v3_path = None
         self.scene_edits = []            # ("scene", camera, start, end)
         self.scenes = []                 # the resolved timeline
-        self._peaks_job = None       # debounce for processed-waveform refresh
-        self._peaks_busy = False
+        # index -> ((path, duration), peaks) - skip recomputing a track's
+        # peaks when neither has changed since the last computation. Cleared
+        # whenever tracks are (re)loaded.
+        self._peaks_cache = {}
         self._autosave_job = None
 
         self._build_ui()
@@ -223,7 +240,7 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
     def _on_close(self):
         # Cancel the repeating callbacks first: destroying the window with them
         # still queued makes Tk complain about invalid command names.
-        for attr in ("_tick_job", "_log_job", "_autosave_job", "_peaks_job"):
+        for attr in ("_tick_job", "_log_job", "_autosave_job"):
             job = getattr(self, attr, None)
             if job:
                 try:
@@ -357,12 +374,20 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
 
         swap(self.speaker_paths)
         swap(self.speaker_media)
+        swap(self._audio_durations)
         swap(self.per_speaker_words)
         swap(self.per_speaker_speech)
         swap(self.peaks_list)
         swap(self.auto_mutes)
         swap(self.track_chains)
         swap(self.player.tracks)
+        # _bleed_corrected_speech() reads this live on every keep-range
+        # recompute (unlike auto_mutes, which is cross-lane-corrected once
+        # during analysis and cached) - left out of this list, a reorder
+        # would silently compare each lane's audio against the WRONG lane's
+        # loudness data until the next full re-analysis. _speech_hop is a
+        # single shared scalar, not per-lane, so it needs no swap.
+        swap(self._speech_levels)
 
         # Lane numbers inside hand edits refer to positions, so they move too.
         remap = {a: b, b: a}
@@ -389,6 +414,7 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
     def _invalidate_analysis(self):
         self.per_speaker_words = None
         self.peaks_list = []
+        self._peaks_cache = {}
         self.playhead = None
         self._set_export_enabled(False)
         self.summary_label.config(text="Add recordings to see the cuts.")
@@ -425,7 +451,7 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
         status bar already does that job properly.
         """
         state = "disabled" if busy else "normal"
-        for name in ("transcribe_button", "auto_cut_button", "auto_mute_button"):
+        for name in ("transcribe_button", "sync_button", "auto_cut_button", "auto_mute_button"):
             widget = getattr(self, name, None)
             if widget is not None:
                 widget.config(state=state)
@@ -472,32 +498,84 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
 
             duration = max(m.duration_seconds for m in media)
 
-            denoiser = voice_activity.find_denoiser()
-
             # The cuts and auto-mute are decided from a denoised, levelled
             # copy of each track (voice_activity.clean_for_analysis). The
             # WAVEFORM is not: it draws the real recording, so it can show
             # clipping and so the user's own effects visibly change it. Two
             # different questions, two different signals.
             saved = getattr(self, "_saved_speech", None)
+            use_saved = bool(saved) and len(saved) == len(self.speaker_paths)
+
+            # Denoiser lookup is skipped entirely when every current path is
+            # a cache hit - the common case right after removing a track.
+            denoiser = None
+            cache = self._analysis_cache
+            speech_per_speaker = []
             levels_per_speaker = []
             peaks_list = []
+            audio_durations = []
             hop = None
-            if saved and len(saved) == len(self.speaker_paths):
-                speech_per_speaker = saved
-                for index, path in enumerate(self.speaker_paths):
+            for index, path in enumerate(self.speaker_paths):
+                # This track's REAL decoded-audio length, not ffprobe's
+                # container/format duration (media[index].duration_seconds) -
+                # the two can disagree (encoder priming/padding, VFR video, a
+                # probe index that doesn't match the real stream), which is
+                # what made some waveforms appear shifted or flattened
+                # relative to the audio actually heard. See
+                # player.decoded_duration_seconds.
+                audio_duration = decoded_duration_seconds(path)
+                audio_durations.append(audio_duration)
+                # (size, mtime) of the file on disk right now - matches what
+                # player.decode_to_pcm's own cache key uses. Without this, a
+                # file replaced at the SAME path (a re-recording or
+                # re-export) with a duration that doesn't move the shared
+                # timeline's max was served stale speech/levels/peaks here
+                # forever, while playback (decode_to_pcm IS mtime/size-aware)
+                # correctly played the new audio - confirmed 2026-09-13.
+                stat = os.stat(path)
+                fingerprint = (stat.st_size, stat.st_mtime)
+                cached = cache.get(path)
+                if (cached is not None and cached["duration"] == duration
+                        and cached.get("fingerprint") == fingerprint):
+                    # Untouched since the last analysis (same path, same
+                    # file on disk, same shared timeline length) -
+                    # re-decoding would just reproduce this. duration is
+                    # part of the cache key because it changes the peaks
+                    # drawn for every track, not just the one that was added
+                    # or removed.
+                    self.log(f"Reusing analysis for {os.path.basename(path)}")
+                    intervals = cached["speech"]
+                    levels = cached["levels"]
+                    this_hop = cached["hop"]
+                    peaks = cached["peaks"]
+                elif use_saved:
                     self.log(f"Analyzing waveforms of {os.path.basename(path)}")
-                    peaks_list.append(self._peaks_for(index, path, duration))
-            else:
-                speech_per_speaker = []
-                for index, path in enumerate(self.speaker_paths):
+                    intervals = saved[index]
+                    levels = []
+                    this_hop = None
+                    # This track's OWN real duration, not the shared timeline
+                    # one - see _peaks_for's docstring for why the two must
+                    # never be conflated.
+                    peaks = self._peaks_for(index, path, audio_duration)
+                    cache[path] = {"duration": duration, "fingerprint": fingerprint,
+                                   "speech": intervals, "levels": levels,
+                                   "hop": this_hop, "peaks": peaks}
+                else:
+                    if denoiser is None:
+                        denoiser = voice_activity.find_denoiser()
                     self.log(f"Analyzing waveforms of {os.path.basename(path)}")
-                    intervals, levels, hop = voice_activity.speaking_intervals(
+                    intervals, levels, this_hop = voice_activity.speaking_intervals(
                         path, denoiser, duration=duration, log=self.log,
                         with_levels=True)
-                    speech_per_speaker.append(intervals)
-                    levels_per_speaker.append(levels)
-                    peaks_list.append(self._peaks_for(index, path, duration))
+                    peaks = self._peaks_for(index, path, audio_duration)
+                    cache[path] = {"duration": duration, "fingerprint": fingerprint,
+                                   "speech": intervals, "levels": levels,
+                                   "hop": this_hop, "peaks": peaks}
+                speech_per_speaker.append(intervals)
+                levels_per_speaker.append(levels)
+                peaks_list.append(peaks)
+                if this_hop is not None:
+                    hop = this_hop
             self._saved_speech = None
 
             self.log("Preparing audio for playback ...")
@@ -510,6 +588,7 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
                 speech_per_speaker, levels_per_speaker, hop, duration)
 
             self.speaker_media = media
+            self._audio_durations = audio_durations
             self.per_speaker_speech = speech_per_speaker
             self._speech_levels = levels_per_speaker
             self._speech_hop = hop
@@ -523,7 +602,12 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
                      "when you are happy with the edit.")
             self.root.after(0, self._analysis_done)
         except Exception as exc:
+            # The bare message ("list index out of range") doesn't say which
+            # of several per-speaker calls raised it - log where, not just
+            # what, so the next report is diagnosable without reproducing it.
+            import traceback
             self.log(f"ERROR: {exc}")
+            self.log(traceback.format_exc())
             self.root.after(0, lambda e=exc: self._analysis_failed(e))
 
     # ---------- transcription (separate from the edit) ----------
@@ -586,12 +670,24 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
             words_per_speaker = []
             all_segments = []
             for index, path in enumerate(self.speaker_paths):
+                if self._export_cancelled():
+                    self.log("Transcription cancelled.")
+                    self.root.after(0, self._transcription_cancelled)
+                    return
                 self._export_step(
                     f"{os.path.basename(path)}  ({index + 1} of "
                     f"{len(self.speaker_paths)})",
                     index / max(1, len(self.speaker_paths)))
                 data = transcribe(path, model=model, language=language,
-                                  progress=self.log)
+                                  progress=self.log,
+                                  should_cancel=self._export_cancelled)
+                if data is None:
+                    # Cancelled partway through this file - WhisperX prints
+                    # progress continuously, so should_cancel is checked
+                    # against that stream, not just between files.
+                    self.log("Transcription cancelled.")
+                    self.root.after(0, self._transcription_cancelled)
+                    return
                 words = data["words"]
                 self.log(f"  {len(words)} words, {len(data['segments'])} segments")
                 words_per_speaker.append(words)
@@ -619,11 +715,91 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
         self._end_modal_export()
         self._render_transcript()
 
+    def _transcription_cancelled(self):
+        self._stop_busy()
+        self._set_action_state(None)
+        self._end_modal_export()
+
     def _transcription_failed(self, exc):
         self._stop_busy()
         self._set_action_state(None)
         self._end_modal_export()
         messagebox.showerror("Transcription failed", str(exc))
+
+    def open_sync_dialog(self):
+        """
+        The Sync button: pick a reference track, review the detected
+        offsets (editable), then apply.
+
+        Detection itself runs inside the dialog, synchronously - it's pure
+        numpy and fast even for a long episode. Only the actual trim/pad
+        rendering, after the dialog returns, needs the busy/threaded path.
+        """
+        if len(self.speaker_paths) < 2:
+            messagebox.showwarning(
+                "Not enough recordings",
+                "Add at least two recordings before syncing.")
+            return
+        if not self.per_speaker_speech:
+            messagebox.showwarning(
+                "Not analyzed yet",
+                "Wait for analysis to finish before syncing.")
+            return
+        import sync_dialog
+        offsets = sync_dialog.ask(self.root, self.speaker_paths,
+                                  self.per_speaker_speech, self._speech_levels,
+                                  self.timeline_duration)
+        if not offsets:
+            return
+        self.start_sync(offsets)
+
+    def start_sync(self, offsets):
+        if getattr(self, "_sync_running", False):
+            return
+        self._sync_running = True
+        self._set_action_state("syncing")
+        self._start_busy("Syncing")
+        threading.Thread(target=self._sync_worker, args=(offsets,),
+                         daemon=True).start()
+
+    def _sync_worker(self, offsets):
+        try:
+            import sync_render
+            old_paths = list(self.speaker_paths)
+            new_paths = list(self.speaker_paths)
+            any_changed = False
+            for index, offset in offsets.items():
+                if offset == 0.0:
+                    continue
+                path = self.speaker_paths[index]
+                new_paths[index] = sync_render.render_synced_copy(
+                    path, offset, log=self.log)
+                any_changed = True
+            self.speaker_paths = new_paths
+            self.root.after(0, lambda: self._sync_done(any_changed, old_paths))
+        except Exception as exc:
+            self.log(f"ERROR: {exc}")
+            self.root.after(0, lambda e=exc: self._sync_failed(e))
+
+    def _sync_done(self, any_changed, old_paths):
+        self._stop_busy()
+        self._sync_running = False
+        self._set_action_state(None)
+        if any_changed:
+            # Payload is the pre-sync speaker_paths, not a range like the
+            # other edit kinds - undo_edit() restores it wholesale rather
+            # than removing one matching entry from a list.
+            self.edit_history.append(("sync", old_paths))
+            self.log("Sync complete. Re-analyzing.")
+            self.start_analysis()
+        else:
+            self.log("Sync made no changes.")
+
+    def _sync_failed(self, exc):
+        self._stop_busy()
+        self._sync_running = False
+        self._set_action_state(None)
+        messagebox.showerror("Sync failed", str(exc))
 
     def _analysis_done(self):
         self._stop_busy()
@@ -640,6 +816,7 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
         self.canvas.config(height=lane_total)
         self.track_meters.config(height=lane_total)
         self.master_meter.config(height=lane_total)
+        self._sync_lane_scroll()
         self._build_mixer()
         self._restore_project_audio_state()
         self._render_transcript()
@@ -757,10 +934,10 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
         frame.pack(fill="both", expand=True, padx=14, pady=12)
 
         rows = [
-            ("Minimum", self.min_shot_seconds, 0.0, 10.0,
+            ("Shortest a shot may be", self.min_shot_seconds, 1.0, 10.0,
              "Shots shorter than this are absorbed into the one before."),
-            ("Maximum", self.max_shot_seconds, 0.0, 120.0,
-             "Longer than this cuts away to V3 briefly. 0 turns it off."),
+            ("Longest a shot may be", self.max_shot_seconds, 1.0, 120.0,
+             "Longer than this cuts away to V3 briefly."),
         ]
         for caption, variable, low, high, hint in rows:
             ttk.Label(frame, text=caption, style="Panel.TLabel").pack(anchor="w")
@@ -825,15 +1002,32 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
                  + summary + ".")
 
     def recompute_scenes(self):
-        """The automatic timeline, with hand edits replayed over it."""
+        """
+        The automatic timeline, with hand edits replayed over it.
+
+        Prefers the cross-lane levels for who's-really-talking, same as
+        _compute_mutes, but a project opened from disk carries speech
+        intervals without the per-frame levels behind them (the fast reload
+        path skips recomputing those) - falling back to per-track speech
+        there instead of going blank is what keeps camera switching working
+        after a reload, not just on a fresh analysis.
+        """
         import scenes as scenes_mod
 
-        if not self.can_switch_cameras() or not self._speech_levels:
+        if not self.can_switch_cameras() or not self.per_speaker_speech:
             self.scenes = []
             return
-        from silence_detector import active_intervals_by_lane
-        active = active_intervals_by_lane(self._speech_levels,
-                                          self._speech_hop or 0.01)
+        active = self.per_speaker_speech
+        if self._speech_levels and len(self._speech_levels) > 1:
+            from silence_detector import active_intervals_by_lane_or_own
+            try:
+                active = active_intervals_by_lane_or_own(
+                    self._speech_levels, self._speech_hop or 0.01,
+                    self.per_speaker_speech)
+            except Exception as exc:
+                self.log(f"  cross-lane camera-switching detection failed "
+                         f"({exc}); falling back to per-track detection")
+                active = self.per_speaker_speech
         base = scenes_mod.scene_timeline(active, self.timeline_duration,
                                          self.min_shot_seconds.get(),
                                          max_shot_seconds=self.max_shot_seconds.get())
@@ -1106,6 +1300,30 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
             text=f"Any gap where nobody speaks for longer than {gap:.2f} seconds "
                  "is removed.")
 
+    def _bleed_corrected_speech(self):
+        """
+        Cross-lane speech intervals for cut detection.
+
+        A lane's own gate can't tell your voice from the other person
+        bleeding into your mic - the same problem auto-mute already solves
+        with active_intervals_by_lane (see _compute_mutes). Cut detection
+        used to skip this and read each speaker's raw per-track gate output
+        instead, so bleed lingering on an idle mic during a real pause kept
+        the merged "someone is talking" timeline looking continuous - the
+        gap only registered as silence in the sliver right before the bleed
+        decayed below both tracks' gates, which is exactly where the cut
+        landed instead of across the whole pause.
+        """
+        if self._speech_levels and self._speech_hop and len(self._speech_levels) > 1:
+            from silence_detector import active_intervals_by_lane_or_own
+            try:
+                return active_intervals_by_lane_or_own(
+                    self._speech_levels, self._speech_hop, self.per_speaker_speech)
+            except Exception as exc:
+                self.log(f"  cross-lane speech detection failed ({exc}); "
+                         "falling back to per-track detection")
+        return self.per_speaker_speech
+
     def _current_keep_ranges(self):
         if not self.per_speaker_speech:
             return [], []
@@ -1116,7 +1334,7 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
             keep = apply_edits([(0.0, self.timeline_duration)], self.edits)
             return keep, complement_ranges(keep, 0.0, self.timeline_duration)
         return compute_keep_ranges_from_intervals(
-            self.per_speaker_speech, 0.0, self.timeline_duration,
+            self._bleed_corrected_speech(), 0.0, self.timeline_duration,
             int(self.aggressiveness.get()), edits=self.edits,
         )
 
@@ -1210,7 +1428,16 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
                 self.canvas.create_line(0, top, width, top, fill="#333")
 
             n = len(peaks)
-            per_second = n / self.timeline_duration
+            # This lane's OWN real decoded-audio duration (same value passed
+            # to _peaks_for), not the shared timeline one and not ffprobe's
+            # duration_seconds - peaks are bucketed to fit exactly that many
+            # seconds (see _peaks_for's docstring), so mapping them against
+            # any other duration here would read every later peak from the
+            # wrong bucket, same mismatch as if they'd been computed wrong.
+            own_duration = (self._audio_durations[lane_i]
+                            if lane_i < len(self._audio_durations)
+                            else self.timeline_duration)
+            per_second = n / own_duration if own_duration else 0.0
             half = LANE_HEIGHT / 2 - 3
             gain = self.waveform_gain
             for x in range(int(width)):
@@ -1261,12 +1488,13 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
 
         self._draw_scene_lane(width, start, span, lanes_bottom)
 
+        self._playhead_line_id = None
         if self.playhead is not None and start <= self.playhead <= start + span:
             x = self._time_to_x(self.playhead, width, start, span)
             bottom = lanes_bottom + (SCENE_STRIP_HEIGHT
                                      if self.scene_switching.get() else 0)
-            self.canvas.create_line(x, RULER_HEIGHT, x, bottom,
-                                    fill="#ffcc44", width=2)
+            self._playhead_line_id = self.canvas.create_line(
+                x, RULER_HEIGHT, x, bottom, fill="#ffcc44", width=2)
 
         self._sync_scrollbar(start, span)
         self.zoom_label.config(
@@ -1396,17 +1624,19 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
 
     def _draw_lane_axis(self, mid, half):
         """
-        The lane's y axis: ticks at the top, quarters and centre, labelled with
-        the amplitude each one actually represents. The labels follow the
-        Height zoom - at x8 the ceiling is 0.13, not 1.0 - so a magnified lane
-        can always be read for what it is.
+        The lane's y axis: ticks at the top, quarters and centre, labelled in
+        dBFS with the level each one actually represents. The labels follow
+        the Height zoom - at x8 the ceiling is -18 dBFS, not 0 - so a
+        magnified lane can always be read for what it is. Top and bottom
+        share the same dB label (level, not direction - a waveform swings
+        both ways at the same loudness).
         """
         gain = self.waveform_gain
         for fraction in (1.0, 0.5, 0.0, -0.5, -1.0):
             y = mid - fraction * half
             self.canvas.create_line(0, y, 4, y, fill="#666")
-            value = fraction / gain
-            text = "0" if fraction == 0 else f"{value:+.2f}".rstrip("0").rstrip(".")
+            value = abs(fraction) / gain
+            text = "-inf" if fraction == 0 else f"{self._to_db(value):.0f}"
             self.canvas.create_text(6, y, text=text, fill="#888", anchor="w",
                                     font=("TkDefaultFont", 6))
 
@@ -1450,6 +1680,64 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
         self._zoom(1 / ZOOM_STEP if event.delta > 0 else ZOOM_STEP, focus)
         return "break"
 
+    # ---------- vertical lane scrolling ----------
+
+    def _lane_canvases(self):
+        """The three canvases that must scroll as one: the waveform and the
+        two meter strips flanking it. A meter left behind would label the
+        wrong lane."""
+        return (self.canvas, self.track_meters, self.master_meter)
+
+    def _on_lane_scroll(self, *args):
+        """Driven by the scrollbar. Moves all three canvases together."""
+        self.canvas.yview(*args)
+        top = self.canvas.yview()[0]
+        for canvas in (self.track_meters, self.master_meter):
+            canvas.yview_moveto(top)
+
+    def _on_lane_scrollbar_set(self, first, last):
+        """Driven by the canvas. Keeps the thumb in step and hides the whole
+        scrollbar when every lane already fits."""
+        try:
+            fits = float(first) <= 0.0 and float(last) >= 1.0
+        except (TypeError, ValueError):
+            fits = True
+        if fits:
+            if self.wave_vscroll.winfo_ismapped():
+                self.wave_vscroll.pack_forget()
+        else:
+            if not self.wave_vscroll.winfo_ismapped():
+                # Before the canvas, so it keeps its place against the meter.
+                self.wave_vscroll.pack(side="right", fill="y",
+                                       before=self.canvas)
+            self.wave_vscroll.set(first, last)
+
+    def _sync_lane_scroll(self):
+        """
+        Re-states how tall the lane stack is, after tracks are added or removed
+        or the scene strip is toggled. Called wherever the canvas height is set.
+        """
+        height = RULER_HEIGHT + len(self.peaks_list) * LANE_HEIGHT
+        if self.scene_switching.get():
+            height += SCENE_STRIP_HEIGHT
+        for canvas in self._lane_canvases():
+            try:
+                canvas.config(scrollregion=(0, 0, 1, height))
+            except Exception:
+                pass
+        # Nothing below the last lane is worth showing, so a stack that has
+        # shrunk scrolls back up rather than leaving a band of empty timeline.
+        if self.canvas.yview()[1] >= 1.0:
+            self._on_lane_scroll("moveto", 0.0)
+
+    def _canvas_y(self, event):
+        """Widget y -> lane-stack y. They differ once the lanes are scrolled,
+        and every hit test below works in lane-stack coordinates."""
+        try:
+            return self.canvas.canvasy(event.y)
+        except Exception:
+            return event.y
+
     def _x_to_time(self, x):
         width = max(self.canvas.winfo_width(), 1)
         start, span = self._view_bounds()
@@ -1471,12 +1759,12 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
             return
         # Dragging on the CAMERAS strip assigns that camera directly - the
         # row you drag along IS the camera you get.
-        camera = self._scene_row_at(event.y)
+        camera = self._scene_row_at(self._canvas_y(event))
         if camera is not None:
             self._scene_drag = (event.x, self._x_to_time(event.x), camera)
             return
 
-        lane = self._y_to_lane(event.y)
+        lane = self._y_to_lane(self._canvas_y(event))
         if lane is None:
             return
         self._drag_anchor = (event.x, self._x_to_time(event.x), lane)
@@ -1609,12 +1897,13 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
         speaker's own detected speech when levels are missing, which is the
         case for a project saved before this existed.
         """
-        from silence_detector import active_intervals_by_lane
+        from silence_detector import active_intervals_by_lane_or_own
 
         basis = speech_per_speaker
         if levels_per_speaker and hop and len(levels_per_speaker) > 1:
             try:
-                basis = active_intervals_by_lane(levels_per_speaker, hop)
+                basis = active_intervals_by_lane_or_own(
+                    levels_per_speaker, hop, speech_per_speaker)
             except Exception as exc:
                 self.log(f"  cross-lane mute detection failed ({exc}); "
                          "falling back to per-track detection")
@@ -1654,6 +1943,14 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
             if payload < len(self.scene_edits):
                 del self.scene_edits[payload]
             self.recompute_scenes()
+            return
+        if kind == "sync":
+            # payload is the whole pre-sync speaker_paths list, not a range -
+            # restore it wholesale and re-analyze, rather than removing one
+            # matching entry the way every other edit kind does.
+            self.speaker_paths = payload
+            self.log("Undid sync.")
+            self.start_analysis()
             return
         if kind in ("mute", "unmute"):
             lane, start, end = payload
@@ -1760,12 +2057,57 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
                 text=f"{self._fmt_time(pos)} / {self._fmt_time(self.player.duration)}")
             if self.player.is_playing:
                 self.playhead = pos
+                old_view_start = self.view_start
                 self._autoscroll(pos)
-                self._draw_waveform()
+                if self.view_start != old_view_start:
+                    # The visible window actually shifted - everything on
+                    # screen has to move, so a full redraw is the only option.
+                    self._draw_waveform()
+                else:
+                    self._update_playhead_position()
                 self._update_karaoke(pos)
             elif self.play_button.cget("text") == "Pause":
                 self._refresh_transport()      # stream ended on its own
         self._tick_job = self.root.after(60, self._tick)
+
+    def _update_playhead_position(self):
+        """
+        Moves just the playhead line, instead of the full _draw_waveform()
+        _tick used to call every 60ms during playback.
+
+        A full redraw deletes and recreates the ENTIRE waveform - one
+        create_line per horizontal pixel per speaker lane, thousands of
+        canvas items - and doing that 16+ times a second for as long as
+        audio plays pinned the main thread continuously busy, starving
+        mouse clicks. Reproduced live: the window read as completely
+        unresponsive during ordinary playback on a long multi-speaker
+        episode, not just during Apply (which had its own, smaller version
+        of this same mistake in _busy_tick, fixed separately).
+        """
+        if not self.peaks_list or self.playhead is None:
+            return
+        width = self.canvas.winfo_width()
+        if width <= 1:
+            return
+        start, span = self._view_bounds()
+        if not (start <= self.playhead <= start + span):
+            self._draw_waveform()
+            return
+        x = self._time_to_x(self.playhead, width, start, span)
+        n_lanes = len(self.peaks_list)
+        lanes_bottom = RULER_HEIGHT + n_lanes * LANE_HEIGHT
+        bottom = lanes_bottom + (SCENE_STRIP_HEIGHT
+                                 if self.scene_switching.get() else 0)
+        try:
+            if self._playhead_line_id is None:
+                raise TypeError("no playhead line drawn yet")
+            self.canvas.coords(self._playhead_line_id, x, RULER_HEIGHT, x, bottom)
+        except Exception:
+            # No line to move yet (e.g. playback just started before any
+            # full draw happened with a playhead set), or the canvas item
+            # is gone for some other reason - one full draw re-establishes
+            # a valid id rather than silently leaving the playhead frozen.
+            self._draw_waveform()
 
     # ---------- loudness meters ----------
 
@@ -1779,6 +2121,11 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
     def _db_to_fraction(db):
         """Maps dBFS onto 0..1 of the meter's height."""
         return max(0.0, min(1.0, (db - METER_FLOOR_DB) / (0.0 - METER_FLOOR_DB)))
+
+    @staticmethod
+    def _db_to_mul(db):
+        """dB to a linear gain multiplier, for faders stored/applied as a gain."""
+        return 10.0 ** (db / 20.0)
 
     @staticmethod
     def _level_color(db):
@@ -1818,7 +2165,7 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
         """
         slots: [(label, top_y, height, state)] - one vertical meter each.
         Bars are drawn in green/yellow/red zones; the number under each bar is
-        the held peak in dBFS.
+        the average (RMS) level in dBFS - the peak is the held line above it.
         """
         canvas.delete("all")
         width = int(canvas.winfo_width()) or METER_WIDTH
@@ -1861,10 +2208,12 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
                 canvas.create_line(x0, peak_y, x1, peak_y,
                                    fill=self._level_color(state["peak"]), width=2)
 
-            reading = ("-inf" if state["peak"] <= METER_FLOOR_DB
-                       else f"{state['peak']:.1f}")
+            # The number is the average (RMS) reading the bar itself shows -
+            # the peak is already visible as the held line above it.
+            reading = ("-inf" if state["bar"] <= METER_FLOOR_DB
+                       else f"{state['bar']:.1f}")
             canvas.create_text(width / 2, bar_bottom + 9, text=reading,
-                               fill=self._level_color(state["peak"]),
+                               fill=self._level_color(state["bar"]),
                                font=("TkDefaultFont", 8, "bold"))
 
             if scale:
@@ -1889,78 +2238,45 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
             self.track_meters.config(height=height)
         self._draw_meter(self.track_meters, slots)
 
-        # Master meter spans the full lane stack.
+        # Master meter fills the whole waveform panel top-to-bottom, not just
+        # the lane stack - with few tracks the lane-stack height left its
+        # green/yellow/red zones too short to read at a glance.
+        panel_height = self.canvas.winfo_height()
+        if panel_height <= 1:
+            panel_height = height
         master = self._update_meter_state("master", self.player.master_rms,
                                           self.player.master_peak)
-        if int(self.master_meter.cget("height")) != height:
-            self.master_meter.config(height=height)
+        if int(self.master_meter.cget("height")) != panel_height:
+            self.master_meter.config(height=panel_height)
         self._draw_meter(self.master_meter,
-                         [("MASTER", RULER_HEIGHT, height - RULER_HEIGHT, master)],
+                         [("MASTER", RULER_HEIGHT, panel_height - RULER_HEIGHT, master)],
                          scale=True)
-
-    # ---------- waveform follows the effects ----------
-
-    def refresh_waveform_for_chains(self, delay_ms=400):
-        """
-        Redraws the waveform through the current VST chains.
-
-        Debounced: a chain edit can arrive on every knob turn while a plugin
-        editor is open, and re-processing an hour of audio on each one would be
-        pointless. The last change within the window wins.
-        """
-        if self._peaks_job is not None:
-            try:
-                self.root.after_cancel(self._peaks_job)
-            except Exception:
-                pass
-        self._peaks_job = self.root.after(delay_ms, self._start_peaks_refresh)
-
-    def _start_peaks_refresh(self):
-        self._peaks_job = None
-        if self._peaks_busy or not self.speaker_paths or not self.timeline_duration:
-            return
-        if self.player is not None and self.player.is_playing:
-            # Redrawing loads a private copy of each plugin, and a plugin load
-            # cannot overlap audio processing - the audio thread would have to
-            # wait for it and you would hear the gap. Monitoring is the more
-            # useful of the two while a knob is being turned, so let playback
-            # own the plugins and pick the redraw up once it stops.
-            self._peaks_job = self.root.after(500, self._start_peaks_refresh)
-            return
-        self._peaks_busy = True
-        threading.Thread(target=self._peaks_worker, daemon=True).start()
 
     def _peaks_for(self, index, path, duration):
         """
-        One speaker's drawn peaks: the real recording with their own chain on
-        top. The single place peaks are made, so the picture after Analyze and
-        the picture after a chain edit cannot drift apart.
+        One speaker's drawn peaks: the real, unprocessed recording - never
+        run through the effect chain. Like Audacity/DaVinci Resolve, the
+        waveform picture never reflects a live/edited effect chain; only the
+        real audio does. That is computed once (Analyze, or a track being
+        added) and never recomputed on a chain edit - there is no redraw to
+        keep in sync with the chain any more.
+
+        `duration` must be THIS track's own real length, never
+        self.timeline_duration (the shared max across every track) - peaks
+        are bucketed to fit exactly that many seconds, so a track shorter
+        than the timeline would have its real audio compressed into fewer
+        samples per bucket than the draw code assumes, silently shifting
+        every later peak earlier than where _draw_waveform looks for it.
+        Confirmed by direct reproduction: real speech onsets/offsets came
+        back reading as flat silence, worse the further into the track.
         """
-        chain = (self.track_chains[index]
-                 if index < len(self.track_chains) else None)
-        return processed_peaks(path, chain, duration, log=self.log)
-
-    def _peaks_worker(self):
-        try:
-            updated = []
-            for index, path in enumerate(self.speaker_paths):
-                updated.append(
-                    self._peaks_for(index, path, self.timeline_duration))
-            self.root.after(0, lambda: self._peaks_refreshed(updated))
-        except Exception as exc:
-            self.log(f"Could not redraw the waveform through the effects: {exc}")
-            self.root.after(0, lambda: setattr(self, "_peaks_busy", False))
-
-    def _peaks_refreshed(self, peaks_list):
-        self._peaks_busy = False
-        if len(peaks_list) != len(self.speaker_paths):
-            return
-        self.peaks_list = peaks_list
-        self._draw_waveform()
-        active = sum(1 for chain in self.track_chains if chain.active_slots())
-        self.log("Waveform redrawn through "
-                 + (f"{active} active effect chain(s)." if active
-                    else "the unprocessed audio."))
+        fingerprint = (path, duration)
+        cached = self._peaks_cache.get(index)
+        if cached is not None and cached[0] == fingerprint:
+            return cached[1]
+        peaks = processed_peaks(path, None, duration, log=self.log)
+        self._peaks_cache[index] = (fingerprint, peaks)
+        return peaks
 
     # ---------- autosave ----------
 
@@ -2093,7 +2409,7 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
                       style="Panel.TLabel").pack(side="left")
 
             track = self.player.tracks[i] if i < len(self.player.tracks) else None
-            vol = tk.DoubleVar(value=(track.gain * 100.0) if track else 100.0)
+            vol = tk.DoubleVar(value=track.gain * 100.0 if track else 100.0)
             muted = tk.BooleanVar(value=bool(track.muted) if track else False)
             soloed = tk.BooleanVar(value=bool(track.soloed) if track else False)
             self.track_vars.append((vol, muted, soloed))
@@ -2117,10 +2433,11 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
             def on_vol(_v=None, idx=i, var=vol):
                 self._set_track(idx, gain=var.get() / 100.0)
 
-            # 0-300%: quiet remote guests often need well over unity.
-            ttk.Scale(fader, from_=0, to=300, orient="horizontal", variable=vol,
-                      command=on_vol).pack(side="left", fill="x", expand=True)
-            value_entry.attach(fader, vol, 0, 300, on_commit=lambda _v, f=on_vol: f(),
+            # 0-300%: quiet remote guests often need well over unity (200-300%).
+            ttk.Scale(fader, from_=0, to=300, orient="horizontal",
+                      variable=vol, command=on_vol).pack(side="left", fill="x", expand=True)
+            value_entry.attach(fader, vol, 0, 300,
+                               on_commit=lambda _v, f=on_vol: f(),
                                width=4).pack(side="left", padx=(4, 0))
             ttk.Label(fader, text="%", style="PanelDim.TLabel").pack(side="left")
 
@@ -2164,8 +2481,6 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
         def on_change():
             self._refresh_fx_button(index)
             self.log(f"{name} chain: {self.track_chains[index].describe()}")
-            # Keep the drawn waveform honest about what the chain is doing.
-            self.refresh_waveform_for_chains()
 
         def on_replace(chain):
             """
@@ -2182,8 +2497,8 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
                 self.player.tracks[index].chain = chain
 
         FxDialog(self.root, name, self.track_chains[index],
-                 on_change=on_change, log=self.log, player=self.player,
-                 on_replace=on_replace)
+                on_change=on_change, log=self.log, player=self.player,
+                on_replace=on_replace, track=self.player.tracks[index])
 
     def _choose_bookend(self, which):
         path = filedialog.askopenfilename(
@@ -2230,9 +2545,10 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
         if not path:
             return
 
-        # Rendering runs a full episode through the plugins in one pass, and
-        # pedalboard holds the GIL for its duration - playback would break up
-        # underneath it. Stop transport first so the two never overlap.
+        # Rendering runs a full episode through the plugins in one pass.
+        # Stop transport first so the two never overlap: the render loads its
+        # own plugin instances, and loading a VST while the audio callback is
+        # inside one is an uncatchable native crash (see vst_host.snapshot).
         self.player.stop()
 
         self._set_export_enabled(False)
@@ -2366,15 +2682,23 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
 
     def _export_video_worker(self, path, keep_ranges, source):
         import tempfile
+        import time
         import video_export
         from audio_export import write_wav
 
         temp_wav = None
         try:
+            # TEMP DIAGNOSTIC TIMING (2026-09-13) - remove once the audio vs.
+            # video phase split for the "export much slower than Resolve"
+            # investigation is measured.
+            export_t0 = time.monotonic()
+
             # 1. the audio, exactly as the WAV export makes it
             self._export_step("Rendering audio...", None)
             gains = [t.gain for t in self.player.tracks]
             mix = self._render_mix(keep_ranges, gains)
+            audio_elapsed = time.monotonic() - export_t0
+            self.log(f"[TIMING] audio phase: {audio_elapsed:.1f}s")
             if self._export_cancelled():
                 raise KeyboardInterrupt
 
@@ -2406,10 +2730,13 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
             #    intro and outro so the sound never runs past the picture.
             self._export_step("Encoding video...", 0.0)
             segments, sources = self.export_segments(keep_ranges)
+            self.log(f"[TIMING] {len(segments)} segments across "
+                     f"{len(sources)} camera source(s)")
             if segments:
                 self._export_step(
                     f"Switching between {len(sources)} cameras "
                     f"({len(segments)} shots)...", 0.0)
+            video_t0 = time.monotonic()
             result = video_export.render(
                 source, temp_wav, path, keep_ranges,
                 segments=segments, sources=sources,
@@ -2417,6 +2744,9 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
                 should_cancel=self._export_cancelled,
                 intro_seconds=intro_seconds, outro_seconds=outro_seconds,
                 intro_path=self.intro_path, outro_path=self.outro_path)
+            video_elapsed = time.monotonic() - video_t0
+            self.log(f"[TIMING] video phase: {video_elapsed:.1f}s "
+                     f"(total export: {time.monotonic() - export_t0:.1f}s)")
 
             if result is None:
                 self.log("Video export cancelled.")
@@ -2444,24 +2774,32 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
     def _render_mix(self, keep_ranges, gains):
         """The summed, processed, cut audio - what export_audio writes."""
         import numpy as np
-        from audio_export import render_track
+        import effects
+        from audio_export import render_tracks
+        from player import SAMPLE_RATE
 
-        rendered = []
-        for i, path in enumerate(self.speaker_paths):
-            self._export_step(f"Rendering {os.path.basename(path)}...", None)
-            track_mutes = [(s, e) for lane, s, e in self.effective_mutes()
-                           if lane == i]
-            chain = self.track_chains[i] if i < len(self.track_chains) else None
-            gain = gains[i] if i < len(gains) else 1.0
-            rendered.append(render_track(path, keep_ranges, track_mutes,
-                                         chain, gain, progress=self.log))
-        length = max(a.size for a in rendered)
-        mix = np.zeros(length, dtype=np.float32)
-        for audio in rendered:
-            mix[:audio.size] += audio
-        peak = float(np.abs(mix).max()) if mix.size else 0.0
+        def progress(message):
+            self.log(message)
+            if message.startswith("Rendering "):
+                self._export_step(message, None)
+
+        # Tracks render in parallel (up to render_tracks's own worker cap) -
+        # see its docstring for why that's safe - but are still summed in a
+        # fixed order and one at a time, matching the old sequential result.
+        mix, _rendered = render_tracks(self.speaker_paths, keep_ranges,
+                                       mutes=self.effective_mutes(),
+                                       chains=self.track_chains, gains=gains,
+                                       progress=progress)
+
+        peak = 0.0
+        for start in range(0, mix.size, 1 << 22):
+            peak = max(peak, float(np.abs(mix[start:start + (1 << 22)]).max()))
         if peak > 1.0:
-            mix /= peak                 # summing speakers can overshoot
+            # Limit the loud moments instead of turning the whole episode
+            # down for one overlap - matches live monitoring and the WAV
+            # export (audio_export.py's export_audio), so video export
+            # sounds the same as both instead of coming out quieter.
+            mix = effects.limiter(mix, SAMPLE_RATE, threshold_db=0.0)
         return mix
 
     def _export_video_done(self, path, extra):
@@ -2506,7 +2844,7 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
         if not path:
             return
 
-        self.player.stop()          # see export_audio_file: baking holds the GIL
+        self.player.stop()          # see export_audio_file for why
 
         self._set_export_enabled(False)
         self._begin_modal_export("Exporting timeline",
@@ -2519,20 +2857,77 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
             media = self.speaker_media
             mutes = self.effective_mutes()
 
-            write_fcpxml(path, media, keep_ranges, mutes=mutes)
+            baked_dir = None
+            if self.bake_effects.get():
+                media, mutes = self._bake_media_for_timeline(path, mutes)
+                baked_dir = os.path.splitext(path)[0] + "_media"
+
+            # Camera-switching picture lanes, mirroring export_segments'
+            # (video export's) own use of the same scene data. V1/V2 are
+            # whatever `media` actually is for THIS export (baked or not),
+            # not self.speaker_media directly, so the picture lanes always
+            # point at the same asset the spine/speaker lanes reference.
+            scenes_for_export = None
+            camera_media = None
+            if self.scene_switching.get() and self.scenes:
+                import scenes as scenes_mod
+                scenes_for_export = scenes_mod.apply_to_keep_ranges(
+                    self.scenes, keep_ranges)
+                camera_media = [media[0], media[1], probe(self.v3_path)]
+
+            write_fcpxml(path, media, keep_ranges, mutes=mutes,
+                        scenes=scenes_for_export, camera_media=camera_media)
             self.log(f"Wrote {os.path.basename(path)}")
 
             extra = self._write_transcript_files(path, keep_ranges)
-            self.root.after(0, lambda: self._export_fcpxml_done(path, extra))
+            self.root.after(
+                0, lambda: self._export_fcpxml_done(path, extra, baked_dir))
         except Exception as exc:
             self.log(f"ERROR writing FCPXML: {exc}")
             self.root.after(0, lambda e=exc: self._export_failed(e))
 
-    def _export_fcpxml_done(self, path, extra):
+    def _bake_media_for_timeline(self, xml_path, mutes):
+        """
+        Writes effect-baked copies of the media and points the timeline at those.
+
+        The FCPXML references media by path and can only describe Final Cut's
+        own effects, so a VST3 chain reaches Resolve one way: inside an actual
+        file. The copies keep the original video stream and stay full length
+        and uncut, so every in/out point the timeline already holds still lands
+        exactly where it did.
+
+        Mutes come back empty because the baked audio is already silent there -
+        emitting them again would only split the clips for no audible reason.
+        """
+        out_dir = os.path.splitext(xml_path)[0] + "_media"
+        gains = [t.gain for t in self.player.tracks]
+        total = len(self.speaker_paths)
+
+        def progress(message):
+            self.log(message)
+            for index, speaker in enumerate(self.speaker_paths):
+                if os.path.basename(speaker) in message:
+                    self._export_step(message, (index + 0.5) / max(1, total) * 0.9)
+                    return
+            self._export_step(message, None)
+
+        baked = bake_processed_media(
+            self.speaker_paths, out_dir, mutes=mutes, chains=self.track_chains,
+            gains=gains, progress=progress)
+        self.log(f"Baked {len(baked)} file(s) into {os.path.basename(out_dir)}")
+        return [probe(p) for p in baked], []
+
+    def _export_fcpxml_done(self, path, extra, baked_dir=None):
         self._end_modal_export()
         self._set_export_enabled(True)
         note = ("\n\nTranscript written:\n" + "\n".join(os.path.basename(p)
                                                         for p in extra)) if extra else ""
+        if baked_dir:
+            # The timeline now points into this folder, so moving one without
+            # the other leaves Resolve with media it cannot find.
+            note += ("\n\nEffects were baked into:\n"
+                     f"{os.path.basename(baked_dir)}\n"
+                     "Keep that folder next to the timeline.")
         messagebox.showinfo(
             "Exported",
             f"Saved:\n{path}\n\nIn DaVinci Resolve:\n"
@@ -2634,6 +3029,22 @@ def _leave_the_install_directory():
             continue
 
 
+def _make_dpi_aware():
+    """Declares the process DPI-aware so Windows renders text natively instead
+    of drawing at 96 DPI and stretching the bitmap - that stretch is what made
+    menu and canvas text look like it had a drop shadow on scaled displays."""
+    if sys.platform != "win32":
+        return
+    import ctypes
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)  # PROCESS_SYSTEM_DPI_AWARE
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
+
 def main():
     # A frozen build has no interpreter to run plugin_editor.py with, so the
     # executable re-launches itself behind this flag to host a plugin window.
@@ -2646,13 +3057,53 @@ def main():
 
     log_handle = _start_crash_log()
     _leave_the_install_directory()
+    _make_dpi_aware()
 
     root = tk.Tk()
+    vst_host.set_main_thread_runner(lambda fn: root.after(0, fn))
+    try:
+        # Tk still assumes 96 DPI unless told otherwise; align its scaling
+        # with the real screen DPI now that Windows is reporting it honestly.
+        root.tk.call("tk", "scaling", root.winfo_fpixels("1i") / 72.0)
+    except Exception:
+        pass
     root.withdraw()
     if not _check_ffmpeg():
         return
     root.deiconify()
     AutoCutApp(root)
+
+    # Started after the app is built, so the first heartbeat is not competing
+    # with the UI construction that legitimately blocks the loop for a moment.
+    # Watches for the event loop going quiet while the process stays alive -
+    # see diagnostics.start_event_loop_watchdog for why app.log() cannot.
+    import diagnostics
+    diagnostics.trace(f"--- session started, {version.APP_NAME} "
+                      f"{version.__version__} ---")
+    diagnostics.start_event_loop_watchdog(root)
+
+    # WhisperX resolution probes each candidate install in a subprocess that
+    # imports torch and checks CUDA - several seconds the first time it runs.
+    # Warm it up now in the background so it is already cached by the time
+    # someone clicks Transcribe, instead of stalling their first click.
+    import whisperx_runner
+    threading.Thread(target=whisperx_runner.resolve, daemon=True).start()
+
+    # The effect chain runs live, in this process, on every audio callback
+    # block (player.py) - so effects.py's envelope follower (numba JIT)
+    # should already be warm before the very first block that needs it,
+    # not compiling cold in the middle of the user's first playback.
+    def _warm_native_effects():
+        import numpy as np
+        import effects
+        try:
+            effects.apply("compressor", np.zeros(4096, dtype=np.float32),
+                          PLAYER_SAMPLE_RATE, effects.defaults("compressor"))
+        except Exception:
+            pass
+
+    threading.Thread(target=_warm_native_effects, daemon=True).start()
+
     try:
         root.mainloop()
     except BaseException:
@@ -2663,7 +3114,19 @@ def main():
             traceback.print_exc(file=log_handle)
             log_handle.flush()
         raise
+    finally:
+        # mainloop() has returned, so the heartbeat has stopped. Left running,
+        # the watchdog would read that as a freeze and write a stall plus a
+        # thread dump on every clean exit - see stop_event_loop_watchdog.
+        diagnostics.stop_event_loop_watchdog()
 
 
 if __name__ == "__main__":
+    # Required before anything else for the isolated Silero VAD worker
+    # process (see silero_vad_onnx.speech_probabilities_isolated) to work in
+    # a PyInstaller-frozen build: without it, a spawned child re-runs this
+    # whole module from the top and launches a second GUI instead of just
+    # running the worker function. A no-op on a normal (non-frozen) run.
+    import multiprocessing
+    multiprocessing.freeze_support()
     sys.exit(main() or 0)
