@@ -1,127 +1,90 @@
 """
-Waveform peaks and audio preview rendering, both via ffmpeg.
+Waveform peaks for drawing.
 
-The waveform is the mix of every speaker, so the quiet stretches you see are
-genuinely "nobody is talking" - the same thing the cut logic keys off.
-
-The preview renders the *edited* audio (silences already removed) so you hear
-what the export will sound like, not the raw recording.
+The waveform is the real recording with the speaker's own VST chain on top,
+never the denoised copy the analysis works from - see processed_peaks.
 """
 
-import os
-import subprocess
-import tempfile
-
 import numpy as np
-
-import bundled
-
-FFMPEG = bundled.tool("ffmpeg")
-PEAK_SAMPLE_RATE = 8000  # plenty for drawing; keeps decode fast
 
 # Peaks are extracted once at this resolution and re-bucketed in the UI when
 # zooming, so zooming never needs another decode. 50/s = 20ms per peak, fine
 # down to word-level zoom, and only ~175k floats for a 58-minute episode.
 PEAKS_PER_SECOND = 50
 
-
-def _amix_filter(n_inputs):
-    if n_inputs == 1:
-        return "[0:a]anull"
-    labels = "".join(f"[{i}:a]" for i in range(n_inputs))
-    return f"{labels}amix=inputs={n_inputs}:duration=longest:normalize=0"
-
-
-def _peaks_from_samples(samples, buckets):
-    if samples.size == 0 or buckets <= 0:
-        return np.zeros(max(buckets, 1), dtype=np.float32)
-    per_bucket = int(np.ceil(samples.size / buckets))
-    padded = np.zeros(per_bucket * buckets, dtype=np.float32)
-    padded[: samples.size] = np.abs(samples)
-    return padded.reshape(buckets, per_bucket).max(axis=1)
+# How much audio is read, processed and reduced to peaks at a time. Matches
+# vst_host.CHUNK_SECONDS, which is the size that module already feeds a plugin
+# when it cannot take a whole track. ~1.4M samples, so ~6MB of float32 per
+# pass instead of the whole episode.
+CHUNK_SECONDS = 30.0
 
 
-def extract_peaks(paths, buckets):
+def _bucket_maxima(block, buckets, per_bucket):
     """
-    Peaks (0..1) of the mixed audio of `paths`, as one array of `buckets` values.
+    Peak magnitude of each `per_bucket`-sample group in `block`.
+
+    `block` is consumed (made absolute in place) - callers here own it. The
+    tail is zero-padded to fill the last bucket, which is what makes a
+    streamed pass agree exactly with reducing the whole track at once.
     """
-    cmd = [FFMPEG, "-v", "error"]
-    for p in paths:
-        cmd += ["-i", p]
-    cmd += [
-        "-filter_complex", _amix_filter(len(paths)) + "[out]",
-        "-map", "[out]",
-        "-ac", "1", "-ar", str(PEAK_SAMPLE_RATE),
-        "-f", "s16le", "-",
-    ]
-    result = subprocess.run(cmd, capture_output=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"ffmpeg peak extraction failed:\n{result.stderr.decode(errors='replace')}")
-
-    samples = np.frombuffer(result.stdout, dtype=np.int16).astype(np.float32) / 32768.0
-    return _peaks_from_samples(samples, buckets)
+    need = buckets * per_bucket
+    if block.size < need:
+        block = np.concatenate(
+            [block, np.zeros(need - block.size, dtype=np.float32)])
+    np.abs(block, out=block)
+    return block.reshape(buckets, per_bucket).max(axis=1)
 
 
-def render_preview(paths, keep_ranges, start_seconds, preview_seconds=15.0):
+def reduce_to_peaks(samples, total, duration_seconds, sample_rate,
+                    peaks_per_second=PEAKS_PER_SECOND, offline=None, log=None):
     """
-    Renders a short WAV of the EDITED audio (keep ranges concatenated), picking
-    up at the first keep range at/after start_seconds and collecting roughly
-    preview_seconds of kept audio.
-
-    Returns the temp WAV path, or None if there's nothing to play.
+    The chunked peak-reduction loop shared by processed_peaks (in-process,
+    no plugins or a live chain via chain.snapshot()) and
+    vst_host._isolated_peaks_worker (a detached chain rebuilt in a fresh
+    child process - see that function for why plugins can't be loaded here
+    on the redraw thread). `samples` is int16 (a memmap straight off the
+    decode cache, or an equivalent array); `offline`, if given, is a
+    TrackChain-like object with the plugins already loaded, run once per
+    chunk exactly as processed_peaks always has.
     """
-    segments = []
-    collected = 0.0
-    for seg_start, seg_end in keep_ranges:
-        if seg_end <= start_seconds:
-            continue
-        s = max(seg_start, start_seconds)
-        e = seg_end
-        if e - s <= 0.01:
-            continue
-        if collected + (e - s) > preview_seconds:
-            e = s + (preview_seconds - collected)
-        segments.append((s, e))
-        collected += e - s
-        if collected >= preview_seconds:
+    buckets = max(1, int(round(duration_seconds * peaks_per_second)))
+    if total == 0:
+        return np.zeros(buckets, dtype=np.float32)
+
+    per_bucket = int(np.ceil(total / buckets))
+    # Whole buckets per pass, so every bucket's peak still sees all of its
+    # samples and the result matches an all-at-once reduction exactly.
+    step = max(1, int(round(CHUNK_SECONDS * sample_rate / per_bucket)))
+
+    peaks = np.zeros(buckets, dtype=np.float32)
+    for first in range(0, buckets, step):
+        last = min(first + step, buckets)
+        start = first * per_bucket
+        if start >= total:
             break
+        block = np.asarray(samples[start:min(last * per_bucket, total)],
+                           dtype=np.float32)
+        block *= 1.0 / 32768.0
 
-    if not segments:
-        return None
+        if offline is not None:
+            # reset only on the first chunk, so plugin state carries across
+            # the joins - the same way vst_host chunks a plugin that cannot
+            # take a whole track. log only there too, or a chatty plugin
+            # would say the same thing once per chunk.
+            processed = offline.process(block, sample_rate, reset=(first == 0),
+                                        log=log if first == 0 else None)
+            if processed.size == block.size:
+                block = processed
 
-    n = len(segments)
-    parts = [_amix_filter(len(paths)) + "[mix]"]
-    parts.append(f"[mix]asplit={n}" + "".join(f"[s{i}]" for i in range(n)))
-    for i, (s, e) in enumerate(segments):
-        parts.append(f"[s{i}]atrim=start={s:.4f}:end={e:.4f},asetpts=PTS-STARTPTS[a{i}]")
-    parts.append("".join(f"[a{i}]" for i in range(n)) + f"concat=n={n}:v=0:a=1[out]")
+        peaks[first:last] = _bucket_maxima(block, last - first, per_bucket)
 
-    out_path = os.path.join(tempfile.gettempdir(), "autocut_preview.wav")
-    cmd = [FFMPEG, "-y", "-v", "error"]
-    for p in paths:
-        cmd += ["-i", p]
-    cmd += [
-        "-filter_complex", ";".join(parts),
-        "-map", "[out]",
-        # winsound needs a plain PCM wav
-        "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "2",
-        out_path,
-    ]
-    result = subprocess.run(cmd, capture_output=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"ffmpeg preview render failed:\n{result.stderr.decode(errors='replace')}")
-    return out_path
-
-
-def peaks_from_samples(samples, buckets):
-    """Peaks for audio already in memory - used for VST-processed waveforms."""
-    return _peaks_from_samples(samples, buckets)
+    return peaks
 
 
 def processed_peaks(path, chain, duration_seconds, log=None,
                     peaks_per_second=PEAKS_PER_SECOND):
     """
-    Peaks for one speaker: the real recording, with their VST chain on top.
+    Peaks for one speaker, for the drawn waveform.
 
     Deliberately the RAW file, not the denoised/levelled copy the analysis
     uses. The waveform has to be the audio - a picture normalized to -14 LUFS
@@ -129,24 +92,32 @@ def processed_peaks(path, chain, duration_seconds, log=None,
     own denoiser look like it does nothing. What the analysis does to decide
     the cuts is its own business; see voice_activity.clean_for_analysis.
 
-    Both the at-rest draw and the redraw after a chain edit come through here,
-    so the two can never disagree.
+    `chain`, if given, runs the audio through it first (via chain.snapshot(),
+    a detached copy - the live chain belongs to the audio callback) before
+    reducing to peaks. app.py's only caller always passes None: the drawn
+    waveform never reflects an edited/live effect chain, matching Audacity/
+    DaVinci Resolve - only the real recording is ever pictured. The
+    capability is kept here (used by streamed callers that do want a
+    processed picture, and covered by tests/test_waveform_peaks.py) rather
+    than removed outright.
+
+    Streamed a chunk at a time - reducing a 2-hour track at once needed three
+    full-length float32 arrays alive together (4.15GB, to produce 1.4MB of
+    peaks). Chunk boundaries are invisible here: the output is one value per
+    20ms, and the same audio is already monitored through 21ms blocks
+    (player.py's stream blocksize).
     """
-    import numpy as np
     from player import SAMPLE_RATE, decode_to_pcm
 
-    pcm_path = decode_to_pcm(path)
-    samples = np.asarray(np.memmap(pcm_path, dtype=np.int16, mode="r"),
-                         dtype=np.float32) / 32768.0
+    samples = np.memmap(decode_to_pcm(path), dtype=np.int16, mode="r")
+    total = samples.shape[0]
 
+    # A detached copy: the live chain belongs to the audio callback, and
+    # driving the same VST from two threads at once crashes the process.
+    offline = None
     if chain is not None and chain.active_slots():
-        # A detached copy: the live chain belongs to the audio callback, and
-        # pushing an hour of audio through it from here would stall the audio
-        # thread and drive the same VST from two threads at once.
         offline = chain.snapshot(log=log)
-        processed = offline.process(samples, SAMPLE_RATE, reset=True, log=log)
-        if processed.size == samples.size:
-            samples = processed
 
-    buckets = max(1, int(round(duration_seconds * peaks_per_second)))
-    return _peaks_from_samples(samples, buckets)
+    return reduce_to_peaks(samples, total, duration_seconds, SAMPLE_RATE,
+                           peaks_per_second=peaks_per_second, offline=offline,
+                           log=log)

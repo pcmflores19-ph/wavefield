@@ -11,7 +11,6 @@ live in `.cache/`, are keyed by file content, and rebuild on demand - putting
 them here would make projects enormous for no gain.
 """
 
-import base64
 
 import chain_io
 import json
@@ -50,6 +49,7 @@ def build(app):
         "intro_path": app.intro_path,
         "outro_path": app.outro_path,
         "export_stems": bool(app.export_stems.get()),
+        "bake_effects": bool(app.bake_effects.get()),
         # Speech is measured from the waveform, and re-measuring it means
         # decoding and denoising every track again - minutes of work for a
         # result that cannot have changed. The transcript is stored for the

@@ -119,8 +119,19 @@ a = Analysis(
     # functions, so PyInstaller's import scan does not see them.
     hiddenimports=[
         "plugin_editor",
+        # Imported only inside functions, so PyInstaller's import scan can't
+        # see them - the problem report, the freeze trace (vst_host/
+        # fx_dialog), the Sync dialog/render, and VAD-based cut detection.
+        "diagnostics",
+        "report_dialog",
+        "sync_dialog",
+        "sync_render",
+        "silero_vad_onnx",
+        "ollama_client",
         "sounddevice",
         "pedalboard",
+        "numba",
+        "llvmlite",
     ],
     hookspath=[],
     runtime_hooks=[],

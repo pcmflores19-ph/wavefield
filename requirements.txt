@@ -10,3 +10,20 @@ sounddevice>=0.4.6
 # VST3 effects. Optional in the sense that the app starts and cuts without it -
 # only the FX buttons stop working.
 pedalboard>=0.9
+
+# Speech detection (silero_vad_onnx.py), used to decide where the cuts go.
+# The silero-vad PyPI package itself is not used - it hard-requires torch/
+# torchaudio even on its "onnx" path (confirmed by reading its source), which
+# would pull in the same multi-GB weight already rejected for WhisperX. Only
+# the bundled model file (assets/silero_vad.onnx, MIT licensed) plus this
+# plain inference runtime are used. Falls back to the old energy gate if
+# unavailable, so it starts and cuts without it too.
+onnxruntime>=1.16
+
+# JIT for the sample-by-sample envelope follower and biquad filter
+# (effects.py, voice_activity.py) - ~50-100x faster than the plain-Python
+# fallback those files already have, which is what silently ran instead of
+# this on every machine before 2026-09-11 (numba was never actually
+# installed). Optional in the same sense as pedalboard: analysis still works
+# without it, just much slower on long files.
+numba>=0.59

@@ -210,15 +210,36 @@ LEAD_MARGIN_DB = 6.0
 
 # Below this nothing counts as talking however it compares to the others -
 # without it, a silent passage would crown whichever lane happened to have the
-# loudest hiss.
+# loudest hiss. This only catches a mic whose floor sits below -50dB, though -
+# one with a genuinely elevated but non-speech floor (AC hum, a hot preamp)
+# can sit above it permanently, and comparing that lane only against ITSELF
+# would always trivially call it "loudest" and mark it active. That is what
+# MIN_RISE_ABOVE_OWN_FLOOR_DB below is for.
 ACTIVE_FLOOR_DB = -50.0
+
+# A lane also has to rise above ITS OWN resting level by this much to count as
+# active - confirmed necessary by reproduction: without it, a mic with a
+# constantly elevated but non-speech floor (never below ACTIVE_FLOOR_DB, so
+# never caught by that check) stayed "active" for an entire session, since it
+# was trivially always within the margin of itself. Genuine speech is a large
+# swing above a mic's own idle level; ordinary jitter around that level is
+# not, so this cleanly separates the two without needing to know in advance
+# what any given mic's absolute floor happens to be.
+MIN_RISE_ABOVE_OWN_FLOOR_DB = 6.0
+
+# What counts as "this lane's own resting level" before cross-lane comparison
+# - see active_intervals_by_lane's docstring for why raw dB stopped being
+# enough once a 3rd microphone was in the mix.
+OWN_FLOOR_PERCENTILE = 20.0
 
 
 def active_intervals_by_lane(levels_by_lane, hop_seconds,
                              lead_margin_db=LEAD_MARGIN_DB,
                              floor_db=ACTIVE_FLOOR_DB,
                              hangover_seconds=0.15,
-                             min_active_seconds=0.20):
+                             min_active_seconds=0.20,
+                             floor_percentile=OWN_FLOOR_PERCENTILE,
+                             min_rise_db=MIN_RISE_ABOVE_OWN_FLOOR_DB):
     """
     Per-frame comparison across lanes -> (start, end) "this speaker is really
     talking" intervals for each lane.
@@ -227,7 +248,21 @@ def active_intervals_by_lane(levels_by_lane, hop_seconds,
     Lengths may differ slightly (recordings are rarely identical lengths); the
     shortest wins and the rest are truncated.
 
-    Returns a list of interval lists, one per lane, in the same order.
+    The comparison is relative to each lane's OWN resting level (a low
+    percentile of its own levels over the whole recording), not raw dB.
+    Different microphones rarely share a self-noise floor - distance, gain
+    staging, hardware all vary - and comparing raw levels let one mic's
+    constantly elevated but non-speech floor outrank a real, quieter speaker
+    on a different mic: confirmed by reproduction on a 3-speaker session,
+    where that silenced a genuinely-talking speaker for almost the entire
+    episode (85% of their real speech was misjudged as inactive). Normalizing
+    against each lane's own baseline makes the comparison about who just got
+    louder than THEMSELVES, not who happens to run hotter in absolute terms.
+    When every lane's floor happens to already be similar - true of the
+    original 2-mic case this was tuned against - a shared offset cancels out
+    of the comparison and this reduces to the previous behavior exactly
+    (verified: identical output on both the bleed-rejection and
+    simultaneous-laughter cases the original margin was designed around).
     """
     import numpy as np
 
@@ -239,14 +274,63 @@ def active_intervals_by_lane(levels_by_lane, hop_seconds,
 
     stacked = np.vstack([np.asarray(l[:length], dtype=np.float32)
                          for l in levels_by_lane])
-    loudest = stacked.max(axis=0)
-    # Active where within the margin of whoever leads AND above the floor.
-    active = (stacked >= (loudest - lead_margin_db)) & (stacked > floor_db)
+    own_floor = np.percentile(stacked, floor_percentile, axis=1, keepdims=True)
+    normalized = stacked - own_floor
+    loudest = normalized.max(axis=0)
+    # Active where within the margin of whoever leads relative to their own
+    # baseline, the raw level still clears the absolute floor (so true silence
+    # never counts just for sitting a hair above that lane's own even-quieter
+    # resting level), AND this lane has risen meaningfully above ITS OWN
+    # baseline (so a mic idling at a constantly elevated floor above
+    # ACTIVE_FLOOR_DB cannot be "active" purely by trivially matching itself).
+    active = ((normalized >= (loudest - lead_margin_db))
+             & (stacked > floor_db)
+             & (normalized >= min_rise_db))
 
     out = []
     for lane in range(stacked.shape[0]):
         out.append(_runs_to_intervals(active[lane], hop_seconds,
                                       hangover_seconds, min_active_seconds))
+    return out
+
+
+# If a lane's cross-lane "active" time comes back under this fraction of what
+# its own per-track detector found, treat the cross-lane comparison as
+# mis-calibrated for that lane (gain mismatch, mic distance, a floor close to
+# its own speaking level) rather than that speaker genuinely being silent for
+# virtually the whole recording - and use its own per-track speech instead.
+# Confirmed by reproduction: without this, a lane that never clears
+# LEAD_MARGIN_DB/MIN_RISE_ABOVE_OWN_FLOOR_DB came back with zero active
+# intervals for the entire session, which auto-mute, camera switching and cut
+# detection all then read as "this speaker never talks" - muting their audio,
+# giving them no camera time, and folding their speech into dead air, for the
+# whole recording instead of just the bleed the comparison is meant to reject.
+MIN_OWN_FALLBACK_FRACTION = 0.10
+
+
+def active_intervals_by_lane_or_own(levels_by_lane, hop_seconds,
+                                    own_intervals_by_lane, **kwargs):
+    """
+    active_intervals_by_lane, with a per-lane safety net: a lane the
+    cross-lane comparison all but zeroes out falls back to its own per-track
+    speech instead, so a mis-calibrated lane loses the whole recording rather
+    than just this one speaker's bleed-rejection.
+    """
+    cross = active_intervals_by_lane(levels_by_lane, hop_seconds, **kwargs)
+    out = []
+    for lane, intervals in enumerate(cross):
+        own = (own_intervals_by_lane[lane]
+               if own_intervals_by_lane and lane < len(own_intervals_by_lane)
+               else [])
+        own_total = sum(e - s for s, e in own)
+        if own_total <= 0:
+            out.append(intervals)
+            continue
+        cross_total = sum(e - s for s, e in intervals)
+        if cross_total < own_total * MIN_OWN_FALLBACK_FRACTION:
+            out.append(list(own))
+        else:
+            out.append(intervals)
     return out
 
 

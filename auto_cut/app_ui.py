@@ -211,6 +211,14 @@ class UIBuilderMixin:
         not have to take it on trust.
         """
         import diagnostics
+        import report_dialog
+
+        has_form = not links.is_placeholder(links.REPORT_FORM)
+        send_step = (
+            "A form will then open in your browser where you can attach the "
+            "file and send it to us."
+            if has_form else
+            "It is up to you whether to send it to us.")
 
         if not messagebox.askokcancel(
                 "Report a problem",
@@ -222,12 +230,13 @@ class UIBuilderMixin:
                 "log from this session." + chr(10) * 2 +
                 "It does NOT include your recordings, your transcript, or the "
                 "folders your files live in." + chr(10) * 2 +
-                "Nothing is sent anywhere. The file is saved on this computer "
-                "and it is up to you whether to send it."):
+                "The file is saved on this computer first. " + send_step):
             return
 
+        description = report_dialog.ask(self.root)
+
         try:
-            path = diagnostics.write_report(self)
+            path = diagnostics.write_report(self, description=description)
         except Exception as exc:
             messagebox.showerror(
                 "Could not write the report",
@@ -235,7 +244,15 @@ class UIBuilderMixin:
             return
 
         self.log(f"Wrote problem report: {os.path.basename(path)}")
-        if not diagnostics.reveal(path):
+        revealed = diagnostics.reveal(path)
+
+        if has_form:
+            messagebox.showinfo(
+                "Report saved",
+                "Saved to:" + chr(10) + path + chr(10) * 2 +
+                "A form will now open - please attach this file there.")
+            self._open_url(links.REPORT_FORM)
+        elif not revealed:
             messagebox.showinfo("Report saved", f"Saved to:{chr(10)}{path}")
 
     def _show_help(self, title, body):
@@ -337,10 +354,19 @@ class UIBuilderMixin:
         lower = ttk.Frame(pane)
         pane.add(lower, weight=2)
 
-        self._build_inspector(upper)
+        # Horizontal sash between the inspector and the transcript/log area,
+        # so a long filename or a wide mixer strip isn't stuck at whatever
+        # width happened to be chosen up front.
+        upper_pane = ttk.PanedWindow(upper, orient="horizontal")
+        upper_pane.pack(fill="both", expand=True)
 
-        left = ttk.Frame(upper)
-        left.pack(side="left", fill="both", expand=True)
+        # ttk.PanedWindow panes have no minsize (same limitation noted above
+        # for the vertical pane) - nothing stops the sash being dragged to
+        # an unusably narrow width, same as the existing vertical split.
+        left = ttk.Frame(upper_pane)
+        upper_pane.add(left, weight=3)
+
+        self._build_inspector(upper_pane)
 
         # Transcript, beside the audio rather than on another page.
         transcript = ttk.Frame(left, style="Panel.TFrame")
@@ -429,8 +455,14 @@ class UIBuilderMixin:
         return outer, inner
 
     def _build_inspector(self, parent):
+        """
+        `parent` is the horizontal ttk.PanedWindow built in _build_edit_page,
+        not a plain container - added as a pane (not packed) so its width is
+        the draggable sash position, not a fixed constant. INSPECTOR_WIDTH is
+        still the width it starts at.
+        """
         outer, inspector = self._scrollable(parent, width=INSPECTOR_WIDTH)
-        outer.pack(side="right", fill="y", padx=(3, 6), pady=6)
+        parent.add(outer, weight=1)
 
         # --- media
         ttk.Label(inspector, text="MEDIA", style="PanelDim.TLabel").pack(
@@ -462,10 +494,9 @@ class UIBuilderMixin:
         actions.columnconfigure(1, weight=1)
 
         self.transcribe_button = ttk.Button(
-            actions, text="Transcribe", style="Accent.TButton",
+            actions, text="Transcribe",
             command=self.open_transcribe_dialog)
-        self.transcribe_button.grid(row=0, column=0, columnspan=2,
-                                    sticky="ew", padx=1, pady=1)
+        self.transcribe_button.grid(row=0, column=0, sticky="ew", padx=1, pady=1)
 
         # Language and model are chosen in the Transcribe dialog now - two
         # places to set one thing, one of which did nothing until you pressed a
@@ -474,7 +505,12 @@ class UIBuilderMixin:
         self.language = tk.StringVar(value=DEFAULT_LANGUAGE)
         self.whisper_model = tk.StringVar(value=DEFAULT_MODEL)
 
-        self.auto_cut_on = tk.BooleanVar(value=True)
+        self.sync_button = ttk.Button(
+            actions, text="Sync",
+            command=self.open_sync_dialog)
+        self.sync_button.grid(row=0, column=1, sticky="ew", padx=1, pady=1)
+
+        self.auto_cut_on = tk.BooleanVar(value=False)
         self.auto_cut_button = ttk.Checkbutton(
             actions, text="Auto-cut", style="Toggle.TCheckbutton",
             variable=self.auto_cut_on, command=self._on_auto_cut_toggle)
@@ -623,21 +659,49 @@ class UIBuilderMixin:
                                       background=ui_theme.TIMELINE_BG,
                                       highlightthickness=0)
         self.track_meters.pack(side="left", fill="y")
+        ui_theme.attach_tooltip(
+            self.track_meters,
+            "Bar = average level (RMS). Line = the loudest recent instant "
+            "(peak-hold), measured after this track's own effects and fader.")
         self.master_meter = tk.Canvas(wave_row, width=METER_WIDTH,
                                       height=LANE_HEIGHT + RULER_HEIGHT,
                                       background=ui_theme.TIMELINE_BG,
                                       highlightthickness=0)
         self.master_meter.pack(side="right", fill="y")
+        ui_theme.attach_tooltip(
+            self.master_meter,
+            "Bar = average level (RMS). Line = the loudest recent instant, "
+            "measured BEFORE the safety limiter - so it can flag a moment "
+            "that would have clipped even though the limiter caught it and "
+            "what you actually hear/export never clipped.")
+        # Vertical scrollbar for the lanes. Every speaker gets a LANE_HEIGHT
+        # lane, so four tracks need ~315px - more than the timeline pane has at
+        # its default size. Without this the pane simply clipped after the
+        # first lane and gave no sign the others existed at all.
+        #
+        # Packed BEFORE the canvas and after the master meter, so it sits
+        # between them rather than outside the meter.
+        self.wave_vscroll = ttk.Scrollbar(wave_row, orient="vertical",
+                                          command=self._on_lane_scroll)
+        self.wave_vscroll.pack(side="right", fill="y")
+        # Hidden until it is actually needed - see _sync_lane_scroll.
+        self.wave_vscroll.pack_forget()
+
         self.canvas = tk.Canvas(wave_row, height=LANE_HEIGHT + RULER_HEIGHT,
                                 background=ui_theme.TIMELINE_BG,
-                                highlightthickness=0, cursor="hand2")
+                                highlightthickness=0, cursor="hand2",
+                                yscrollcommand=self._on_lane_scrollbar_set)
         self.canvas.pack(side="left", fill="both", expand=True)
         # The waveform is what gives when the pane is resized.
         wave_row.pack_propagate(False)
         self.canvas.bind("<Button-1>", self._on_press)
         self.canvas.bind("<B1-Motion>", self._on_drag)
         self.canvas.bind("<ButtonRelease-1>", self._on_release)
-        self.canvas.bind("<Configure>", lambda e: self._draw_waveform())
+        # Resizing the pane changes how many lanes fit, so the scrollbar has
+        # to reappear or vanish with it, not only when tracks are added.
+        self.canvas.bind("<Configure>",
+                         lambda e: (self._sync_lane_scroll(),
+                                    self._draw_waveform()))
         self.canvas.bind("<MouseWheel>", self._on_wheel)
         self.canvas.bind("<Shift-MouseWheel>", self._on_shift_wheel)
 
@@ -731,6 +795,7 @@ class UIBuilderMixin:
         """
         self.export_stems = tk.BooleanVar(value=False)
         self.export_transcript = tk.BooleanVar(value=True)
+        self.bake_effects = tk.BooleanVar(value=False)
         self.intro_path = None
         self.outro_path = None
 
@@ -747,6 +812,11 @@ class UIBuilderMixin:
         menu.add_checkbutton(
             label="Write the transcript alongside exports (.srt, .vtt, .txt)",
             variable=self.export_transcript)
+        # Without this the FCPXML points at the untouched recordings, and every
+        # effect you set up here is simply absent in Resolve.
+        menu.add_checkbutton(
+            label="Bake effects into the media for Resolve (slower, writes copies)",
+            variable=self.bake_effects)
         menu.add_separator()
         # Indices are remembered so the labels can show what is currently set
         # - a menu that never changes gives no way to tell.
@@ -795,16 +865,17 @@ class UIBuilderMixin:
                         for m in (self.speaker_media or []))
         # (0) FCPXML timeline, (1) WAV, (2) MP4 - only the WAV works audio-only.
         needs_video = {0, 2}
-        switching = (hasattr(self, "scene_switching")
-                     and self.scene_switching.get())
+        # FCPXML timeline export during camera switching: an earlier attempt
+        # described the switch directly in FCPXML and Resolve rearranged the
+        # clips it was given - this entry was disabled outright ever since.
+        # Fixed 2026-09-13: build_fcpxml now expresses the switch as static-
+        # reference picture lanes (enabled/disabled per scene, never
+        # swapping which asset a lane points to), confirmed working by
+        # direct Resolve import - so FCPXML now follows the same has-video
+        # rule as every other export during switching too.
         for index in self.export_menu_entries:
             allowed = state
             if enabled and index in needs_video and not has_video:
-                allowed = "disabled"
-            # A timeline cannot carry the camera switching: Resolve rearranges
-            # what it is given, which is what sank the first attempt at this.
-            # Video and audio export still work.
-            if index == 0 and switching:
                 allowed = "disabled"
             self.export_menu.entryconfig(index, state=allowed)
 

@@ -20,6 +20,32 @@ import version
 import whisperx_runner
 
 
+def _scrollable(parent):
+    """
+    A vertically scrolling panel, same pattern as UIBuilderMixin._scrollable
+    in app_ui.py - duplicated rather than shared because this dialog is a
+    standalone Toplevel, not part of that mixin. Tagged with _wheel_scrolls
+    so the app's window-wide wheel handler (root.bind_all in app.py) routes
+    scroll events here too, the same as every other scrollable panel.
+    """
+    outer = ttk.Frame(parent, style="Panel.TFrame")
+    canvas = tk.Canvas(outer, background=ui_theme.PANEL, highlightthickness=0)
+    bar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+    canvas.configure(yscrollcommand=bar.set)
+    bar.pack(side="right", fill="y")
+    canvas.pack(side="left", fill="both", expand=True)
+
+    inner = ttk.Frame(canvas, style="Panel.TFrame", padding=12)
+    window = canvas.create_window((0, 0), window=inner, anchor="nw")
+    inner.bind("<Configure>",
+               lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+    canvas.bind("<Configure>",
+                lambda e: canvas.itemconfig(window, width=e.width))
+    for widget in (outer, canvas, inner):
+        widget._wheel_scrolls = canvas
+    return outer, inner
+
+
 class SettingsDialog(tk.Toplevel):
     def __init__(self, parent, log=None):
         super().__init__(parent)
@@ -30,8 +56,8 @@ class SettingsDialog(tk.Toplevel):
         self.minsize(600, 380)
         self.transient(parent)
 
-        frame = ttk.Frame(self, style="Panel.TFrame")
-        frame.pack(fill="both", expand=True, padx=12, pady=12)
+        outer, frame = _scrollable(self)
+        outer.pack(fill="both", expand=True)
 
         ttk.Label(frame, text="TRANSCRIPTION",
                   style="PanelDim.TLabel").pack(anchor="w")
@@ -72,7 +98,11 @@ class SettingsDialog(tk.Toplevel):
                        "asks GitHub for the latest version number and nothing "
                        "else - your recordings never leave this computer. With "
                        "this off, the dot in the menu bar stays grey and you "
-                       "can still check by hand from the Help menu."
+                       "can still check by hand from the Help menu.\n\n"
+                       "This only checks and notifies - it never downloads or "
+                       "installs anything by itself. To actually update, use "
+                       "Help > Check for updates, which downloads the "
+                       "installer and asks you to close Wavefield to run it."
                   ).pack(anchor="w", pady=(2, 0))
 
         ttk.Separator(frame).pack(fill="x", pady=(12, 10))

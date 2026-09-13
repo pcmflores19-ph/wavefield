@@ -9,9 +9,9 @@ moment it opens is a surprise and this one is aimed at people who value
 everything staying on their own machine. It is the only network request
 Wavefield makes.
 
-Best-effort throughout, in the same spirit as ollama_client: no network, a
-rate-limit, a repository with no releases yet - all of those are ordinary, and
-none of them is an error worth a traceback.
+Best-effort throughout: no network, a rate-limit, a repository with no
+releases yet - all of those are ordinary, and none of them is an error worth
+a traceback.
 """
 
 import json

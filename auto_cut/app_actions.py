@@ -7,14 +7,11 @@ actions the new pages hang off.
 
 import os
 import re
-import threading
-import tkinter as tk
 from tkinter import filedialog, messagebox
 
 import project as project_io
 import version
-from whisperx_runner import (DEFAULT_MODEL, LANGUAGES, language_label,
-                             model_label)
+from whisperx_runner import DEFAULT_MODEL
 
 
 class ActionsMixin:
@@ -58,13 +55,14 @@ class ActionsMixin:
         self._speech_levels = None
         self._speech_hop = None
         self._saved_speech = None
+        self._analysis_cache = {}
         self.auto_mutes = []
         self.speaker_media = []
         self._pending_project = None
         self.whisper_model.set(DEFAULT_MODEL)
         self.aggressiveness.set(50)
         self.auto_mute_on.set(False)
-        self.auto_cut_on.set(True)
+        self.auto_cut_on.set(False)
 
         self._render_transcript()          # clears the transcript panel
         self._build_mixer()                # drops the old per-track FX buttons
@@ -156,11 +154,18 @@ class ActionsMixin:
         self.intro_path = data.get("intro_path")
         self.outro_path = data.get("outro_path")
         self.export_stems.set(bool(data.get("export_stems", False)))
+        self.bake_effects.set(bool(data.get("bake_effects", False)))
         self.transcript = data.get("transcript")
         # Reused by the next analysis pass instead of re-detecting; dropped if
         # the speaker list no longer matches (see _analyze_worker).
         self._saved_speech = [[tuple(iv) for iv in speech]
                               for speech in data.get("speech", [])] or None
+        # True (not False) here: a project saved before Auto-cut existed as
+        # a toggle predates this key entirely, and cuts were unconditional
+        # then - defaulting a reopened old project to off would silently
+        # change its established behavior. Only a genuinely NEW project
+        # (new_project(), below) and the app's own initial state default to
+        # off; a project that already recorded its own choice keeps it.
         self.auto_cut_on.set(bool(data.get("auto_cut", True)))
 
         self.v3_path = data.get("v3_path")
@@ -220,6 +225,9 @@ class ActionsMixin:
                 track.chain = chain
         self._pending_project = None
         self._build_mixer()
+        # No waveform refresh needed here: the drawn waveform is always the
+        # real unprocessed audio now (see app.py's _peaks_for), never the
+        # chain's output, so reattaching these chains has nothing to redraw.
         self.log("Restored saved mixer and effects.")
 
     # ------------------------------------------------------- transcript editor

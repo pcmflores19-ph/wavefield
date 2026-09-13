@@ -13,6 +13,10 @@ YOUTUBE = "https://www.youtube.com/@marineearthscience"
 SPOTIFY = "https://open.spotify.com/show/4NTLrSfceKjpFvZWflzBJj"
 FACEBOOK = "https://www.facebook.com/btspodcastph"
 
+# Filled in once the form exists. Until then is_placeholder() keeps
+# "Report a problem" from opening a dead link.
+REPORT_FORM = "https://example.com/report-form"
+
 PODCAST_NAME = "Behind The Science Podcast"
 
 # Menu order. Buy Me a Coffee sits on its own above the rest because it is the

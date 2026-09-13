@@ -156,7 +156,7 @@ def clear_cache():
     return removed, freed, skipped
 
 
-def prune_cache(max_total_bytes=2_000_000_000, max_age_days=14):
+def prune_cache(max_total_bytes=8_000_000_000, max_age_days=14):
     """
     Keeps the analysis cache from growing forever, without ever deleting the
     crash-recovery autosave or a file something else has locked open.
@@ -167,6 +167,12 @@ def prune_cache(max_total_bytes=2_000_000_000, max_age_days=14):
     survivors go next until back under budget. A locked file (memory-mapped
     for playback, most likely) is left in place either way - the OS itself
     refuses that delete, this just doesn't treat it as an error.
+
+    Default raised from 2GB (2026-09-11): a single 3-speaker, ~1 hour session
+    alone produces ~2.3GB of .mono.pcm + .clean16.pcm (measured), so the old
+    default pruned a session's OWN cache on the very next launch, forcing a
+    full needless re-decode. 8GB comfortably covers several sessions like
+    that.
 
     Meant to run once, early, in a background thread - see
     app._prune_cache_worker - not on any hot path.

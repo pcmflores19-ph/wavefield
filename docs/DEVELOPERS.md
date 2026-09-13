@@ -104,7 +104,7 @@ added clips that Resolve then redistributed on import.
 | `auto_cut/voice_activity.py` | Finds speech from the waveform |
 | `auto_cut/silence_detector.py` | Merges speakers, computes keep ranges |
 | `auto_cut/player.py` | Multitrack playback (memory-mapped PCM, live mixing) |
-| `auto_cut/waveform.py` | Waveform peaks via ffmpeg |
+| `auto_cut/waveform.py` | Waveform peaks, with each speaker's VST chain applied |
 | `auto_cut/vst_host.py` | VST3 discovery and per-track effect chains |
 | `auto_cut/fcpxml_writer.py` | Writes the Resolve timeline |
 | `auto_cut/audio_export.py` | Renders the finished WAV |

@@ -5,6 +5,9 @@ auto_cut/.cache/
 # Native crash dumps from faulthandler; they contain local paths.
 autocut_crash.log
 
+# Event-loop stall traces; same reason - they embed full local paths.
+autocut_freeze.log
+
 __pycache__/
 *.py[cod]
 

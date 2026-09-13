@@ -26,7 +26,8 @@ class ProgressDialog(tk.Toplevel):
     thread directly.
     """
 
-    def __init__(self, parent, title="Exporting", message="Working..."):
+    def __init__(self, parent, title="Exporting", message="Working...",
+                 on_cancel=None, modal=True):
         super().__init__(parent)
         self.title(title)
         self.configure(background=ui_theme.BG)
@@ -35,6 +36,16 @@ class ProgressDialog(tk.Toplevel):
 
         self.cancelled = False
         self._closed = False
+        # Some work behind this dialog can't actually be interrupted once
+        # started - a single pedalboard call runs to completion, since the
+        # chain is fed in one pass and nothing checks a flag inside it - so
+        # `cancelled` alone only stops the RESULT from
+        # being used once the worker eventually finishes on its own. Without
+        # this, Cancel would leave the modal grab up for that whole time,
+        # which reads as the app having hung. A caller that can react sooner
+        # passes on_cancel to close the dialog immediately instead.
+        self._on_cancel = on_cancel
+        self._modal = modal
 
         frame = ttk.Frame(self, style="Panel.TFrame")
         frame.pack(fill="both", expand=True, padx=16, pady=14)
@@ -61,7 +72,8 @@ class ProgressDialog(tk.Toplevel):
 
         self.update_idletasks()
         self._centre(parent)
-        self.grab_set()
+        if self._modal:
+            self.grab_set()
 
     def _centre(self, parent):
         try:
@@ -88,10 +100,18 @@ class ProgressDialog(tk.Toplevel):
                 self.bar.config(mode="determinate", maximum=1000)
             self.bar["value"] = max(0.0, min(1.0, fraction)) * 1000
 
+    @property
+    def closed(self):
+        """True once close() has run. A watchdog polling from the Tk thread
+        uses this to tell "still working" from "already finished"."""
+        return self._closed
+
     def _cancel(self):
         self.cancelled = True
         self.cancel_button.config(state="disabled")
         self.detail.config(text="Stopping...")
+        if self._on_cancel is not None:
+            self._on_cancel()
 
     def close(self):
         """

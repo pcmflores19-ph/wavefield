@@ -28,7 +28,9 @@ changes the sound.
 """
 
 import hashlib
+import multiprocessing
 import os
+import tempfile
 
 import numpy as np
 
@@ -75,6 +77,11 @@ ONSET_GUARD_SECONDS = 0.10
 HANGOVER_SECONDS = 0.15
 MIN_SPEECH_SECONDS = 0.20    # shorter than this, after merging, is not a word
 
+# How many 20ms frames _frame_levels squares at a time - see the comment there.
+# 8192 frames is ~63MB of float64 scratch, small enough to be irrelevant next
+# to the track itself and large enough that the loop overhead disappears.
+_RMS_CHUNK_FRAMES = 8192
+
 
 def _load(path):
     """The track as mono float32, straight off the decode cache."""
@@ -96,7 +103,19 @@ def _frame_levels(samples):
         strides=(samples.strides[0] * hop, samples.strides[0]),
         writeable=False,
     )
-    rms = np.sqrt(np.mean(np.square(frames, dtype=np.float64), axis=1))
+    # Squared in blocks of frames, not all at once. The view is free, but
+    # np.square(frames, dtype=np.float64) is not: frames overlap 2:1, so it
+    # materialises ~2x the track as float64 - measured at 2.9GB for one
+    # 67-minute track, which is most of what took the process down with an
+    # access violation partway through a 3-speaker analysis (see
+    # autocut_crash.log; native code faults where Python would raise
+    # MemoryError). Each frame's RMS is independent of every other, so this
+    # is the same arithmetic in the same order, just bounded.
+    rms = np.empty(count, dtype=np.float64)
+    for start in range(0, count, _RMS_CHUNK_FRAMES):
+        block = frames[start:start + _RMS_CHUNK_FRAMES]
+        rms[start:start + block.shape[0]] = np.sqrt(
+            np.mean(np.square(block, dtype=np.float64), axis=1))
     return 20.0 * np.log10(np.maximum(rms, 1e-9)), HOP_SECONDS
 
 
@@ -111,18 +130,133 @@ def find_denoiser(plugins=None):
     return None
 
 
+# How long to wait for the isolated denoise worker below before giving up and
+# falling back to raw audio - matches silero_vad_onnx's own worker timeout.
+_DENOISE_WORKER_TIMEOUT_SECONDS = 300.0
+
+
+def _denoise_worker(input_path, output_path, count, plugin_path, sample_rate,
+                    conn):
+    """
+    Runs in the child process: loads rnnoise fresh and runs it start to
+    finish, reading/writing disk-backed memmaps rather than pickling the
+    track through `conn` - see _denoise_isolated for why. Sends
+    ("ok", None) or ("error", message); the parent reads output_path itself.
+    """
+    try:
+        import vst_host
+        samples = np.memmap(input_path, dtype=np.float32, mode="r",
+                            shape=(count,))
+        chain = vst_host.TrackChain()
+        chain.add("rnnoise", plugin_path)
+        result = chain.process(samples, sample_rate, reset=True)
+        if result.size != count:
+            raise RuntimeError("denoised audio length did not match the source")
+        output = np.memmap(output_path, dtype=np.float32, mode="w+",
+                           shape=(count,))
+        output[:] = result
+        output.flush()
+        del output
+        del samples
+        conn.send(("ok", None))
+    except Exception as exc:
+        conn.send(("error", str(exc)))
+    finally:
+        conn.close()
+
+
+def _denoise_isolated(samples, plugin_path, sample_rate):
+    """
+    Runs rnnoise in a fresh child process - same pattern as
+    silero_vad_onnx.speech_probabilities_isolated, and for a related but
+    distinct reason.
+
+    Reproduced directly (2026-09-11): loading rnnoise via
+    vst_host.TrackChain.add()'s main-thread hop, once per speaker, while ALSO
+    spawning a separate child process per speaker for the isolated Silero VAD
+    call, hangs the app by the 3rd speaker - confirmed by elimination: an
+    otherwise-identical repro survived every time once the hop was the only
+    thing removed. A fresh child process here never touches the main thread's
+    plugin-hosting state at all (its own single thread IS its "main thread",
+    with nothing else ever having claimed it), which is exactly the condition
+    that survived in that reproduction - not a workaround, the same fix shape
+    already proven for Silero.
+
+    The array itself crosses into and back out of that process via disk-
+    backed memmaps, not `Process(args=...)` or the pipe - passing the full
+    track either way pickles three copies of it (parent + pickle buffer +
+    child) into existence at once, per speaker, which is what actually
+    crashed/froze long multi-speaker sessions.
+    """
+    directory = settings.cache_dir()
+    os.makedirs(directory, exist_ok=True)
+    fd_in, in_path = tempfile.mkstemp(dir=directory, suffix=".denoise_in.pcm")
+    os.close(fd_in)
+    fd_out, out_path = tempfile.mkstemp(dir=directory, suffix=".denoise_out.pcm")
+    os.close(fd_out)
+    try:
+        count = samples.shape[0]
+        memmap_in = np.memmap(in_path, dtype=np.float32, mode="w+",
+                              shape=(count,))
+        block = _RMS_CHUNK_FRAMES * 64
+        for start in range(0, count, block):
+            stop = min(start + block, count)
+            memmap_in[start:stop] = samples[start:stop]
+        memmap_in.flush()
+        del memmap_in
+
+        parent_conn, child_conn = multiprocessing.Pipe(duplex=False)
+        proc = multiprocessing.Process(
+            target=_denoise_worker,
+            args=(in_path, out_path, count, plugin_path, sample_rate,
+                  child_conn),
+            daemon=True)
+        proc.start()
+        child_conn.close()  # only the child should hold the writable end
+        try:
+            if not parent_conn.poll(_DENOISE_WORKER_TIMEOUT_SECONDS):
+                proc.terminate()
+                proc.join(5.0)
+                raise RuntimeError("rnnoise worker timed out")
+            try:
+                status, payload = parent_conn.recv()
+            except EOFError:
+                proc.join(5.0)
+                raise RuntimeError(
+                    f"rnnoise worker crashed (exit code {proc.exitcode})")
+        finally:
+            parent_conn.close()
+        proc.join(5.0)
+        if status != "ok":
+            raise RuntimeError(f"rnnoise failed in worker process: {payload}")
+
+        # Owned, not a memmap: _lufs_normalize mutates its input in place,
+        # and the backing file is removed in `finally` below.
+        result_mm = np.memmap(out_path, dtype=np.float32, mode="r",
+                              shape=(count,))
+        result = np.array(result_mm, dtype=np.float32)
+        del result_mm
+        return result
+    finally:
+        for path in (in_path, out_path):
+            try:
+                if path and os.path.exists(path):
+                    os.remove(path)
+            except OSError:
+                pass
+
+
 def denoise(samples, plugin_path, log=None):
     """
     Runs the track through rnnoise for analysis purposes only.
 
-    Its own chain and its own plugin instance - never the user's live chain,
-    which belongs to the audio callback.
+    Isolated in its own process, not just its own chain - see
+    _denoise_isolated's docstring for why that is load-bearing, not just
+    tidy: never the user's live chain either way, which belongs to the audio
+    callback.
     """
-    import vst_host
-    chain = vst_host.TrackChain()
     try:
-        chain.add("rnnoise", plugin_path)
-        return chain.process(samples, SAMPLE_RATE, reset=True, log=log)
+        return _denoise_isolated(samples, plugin_path, SAMPLE_RATE)
     except Exception as exc:
         if log:
             log(f"  rnnoise unavailable ({exc}); detecting on the raw waveform")
@@ -295,14 +429,25 @@ def _measure_lufs(samples, sample_rate):
 
 
 def _lufs_normalize(samples, sample_rate, target_lufs=-14.0):
-    """Gains `samples` so its integrated loudness reaches `target_lufs`."""
+    """
+    Gains `samples` so its integrated loudness reaches `target_lufs`.
+
+    Scales IN PLACE: the only caller is clean_for_analysis, which hands over a
+    throwaway copy it drops on return, and on an hour-long track a second
+    full-length array here is 0.72GB for nothing.
+    """
     current = _measure_lufs(samples, sample_rate)
     if current <= -69.0:              # nothing there worth levelling
         return samples
     gain = 10.0 ** ((target_lufs - current) / 20.0)
-    peak = float(np.abs(samples).max()) or 1.0
-    gain = min(gain, 0.99 / peak)      # never clip chasing a loud target
-    return samples * np.float32(gain)
+    # Chunked so the |x| scan does not materialise a second copy of the track.
+    peak = 0.0
+    for start in range(0, samples.size, _RMS_CHUNK_FRAMES * 64):
+        block = samples[start:start + _RMS_CHUNK_FRAMES * 64]
+        peak = max(peak, float(np.abs(block).max()))
+    gain = min(gain, 0.99 / (peak or 1.0))   # never clip chasing a loud target
+    samples *= np.float32(gain)
+    return samples
 
 
 def _percentile_threshold_db(levels_db, percentile=80.0):
@@ -325,6 +470,12 @@ def clean_for_analysis(samples, sample_rate, plugin_path=None, log=None):
     work = samples
     if plugin_path:
         work = denoise(work, plugin_path, log=log)
+    # Dead weight once `work` exists (denoise's own result, or - on the
+    # fallback path - the same object `work` already references): the caller
+    # must not keep its own copy of `samples` alive either, see
+    # cleaned_samples_for, or this full-track array stays resident through
+    # compress+lufs-normalize for nothing.
+    del samples
 
     levels_db, _ = _frame_levels(work)
     threshold_db = _percentile_threshold_db(levels_db, 80.0)
@@ -357,20 +508,45 @@ def cleaned_samples_for(path, denoiser_path=None, log=None):
     than once in a session - reopening a project, or redrawing after an edit
     - and denoising plus compressing an hour of audio is not free.
     """
+    # Every conversion below is done in place or in blocks. An hour-long track
+    # is 0.72GB per float32 copy, and the casual `x.astype(float32) / 32768.0`
+    # this used to do held three of them at once - the kind of arithmetic that
+    # added up to the out-of-memory native crash in autocut_crash.log.
     cache_path = _cleaned_cache_path(path)
     if os.path.exists(cache_path):
         try:
             stored = np.fromfile(cache_path, dtype=np.int16)
             if stored.size:
-                return stored.astype(np.float32) / 32768.0
+                restored = stored.astype(np.float32)
+                del stored
+                restored /= 32768.0
+                return restored
         except Exception:
             pass                            # fall through and rebuild it
-    samples = _load(path)
-    cleaned = clean_for_analysis(samples, SAMPLE_RATE, denoiser_path, log=log)
+    # Not bound to a local first: clean_for_analysis drops its own reference
+    # once denoise's result exists (see its own del samples), and binding it
+    # here too would keep the raw array alive for the whole denoise+compress+
+    # lufs pipeline for nothing - two stack frames, one full track, held
+    # twice as long as needed.
+    cleaned = clean_for_analysis(_load(path), SAMPLE_RATE, denoiser_path,
+                                 log=log)
     cleaned = np.asarray(cleaned, dtype=np.float32)
     try:
-        quantized = np.clip(cleaned * 32767.0, -32768, 32767).astype(np.int16)
-        quantized.tofile(cache_path)
+        quantized = np.empty(cleaned.size, dtype=np.int16)
+        block = _RMS_CHUNK_FRAMES * 64
+        for start in range(0, cleaned.size, block):
+            piece = cleaned[start:start + block]
+            quantized[start:start + piece.size] = np.clip(
+                piece * 32767.0, -32768, 32767).astype(np.int16)
+        # Atomic like player.decode_to_pcm's cache write: writing straight to
+        # cache_path let a concurrent reader (e.g. this same speaker's cache
+        # hit path above, on another thread) np.fromfile a partially-written
+        # file. os.replace is a single filesystem operation - a reader either
+        # sees the old file or the new one, never a truncated one.
+        tmp_path = cache_path + ".part"
+        quantized.tofile(tmp_path)
+        os.replace(tmp_path, cache_path)
+        del quantized
     except Exception:
         pass                                # a missed cache write is not fatal
     return cleaned
@@ -426,14 +602,26 @@ def _merge_close(intervals, max_gap):
 def speaking_intervals(path, denoiser_path=None, duration=None, log=None,
                        with_levels=False, with_samples=False):
     """
-    Returns (start, end) ranges where this speaker is talking, found from the
-    waveform. `denoiser_path` is rnnoise; without it the gate still works, just
-    less cleanly on a noisy room.
+    Returns (start, end) ranges where this speaker is talking, found by
+    Silero VAD (see silero_vad_onnx) on the RAW decoded audio - not the
+    denoised/compressed/normalized copy. The old energy gate held "speaking"
+    open through a natural trailing decay after someone stopped talking
+    (confirmed by direct testing: compression flattens a decay tail's
+    dynamic range, keeping it above threshold for most of a real pause), so
+    cuts landed as a sliver right before the next speaker resumed instead of
+    covering the whole gap. A neural VAD judges speech-likeness directly and
+    isn't fooled by a merely-quieter-but-still-decaying tail the same way.
+    Falls back to the old energy gate if Silero is unavailable for any
+    reason (e.g. onnxruntime missing) - degraded, not broken.
+
+    `denoiser_path` is rnnoise; used only for the cleaned copy below, not for
+    Silero VAD detection itself.
 
     With `with_levels=True` returns (intervals, levels_db, hop) instead. The
-    per-frame levels are what lets auto-mute compare one speaker against
-    another - deciding who is talking from a single microphone in isolation
-    cannot tell a real voice from the other person bleeding into it.
+    per-frame levels (still measured from the cleaned/denoised copy) are what
+    lets auto-mute compare one speaker against another - deciding who is
+    talking from a single microphone in isolation cannot tell a real voice
+    from the other person bleeding into it.
 
     With `with_samples=True` the cleaned copy (see `clean_for_analysis`) comes
     back too, so a caller that also wants to draw the waveform from it - see
@@ -441,12 +629,25 @@ def speaking_intervals(path, denoiser_path=None, duration=None, log=None,
 
     None of this touches the file or the audio the app plays and exports - it
     shapes a throwaway copy used to decide. Deliberately quiet: only genuine
-    problems (like rnnoise being unavailable) reach `log`.
+    problems (like rnnoise or Silero being unavailable) reach `log`.
     """
     work = cleaned_samples_for(path, denoiser_path, log=log)
-
     levels_db, hop = _frame_levels(work)
-    intervals, _floor_db, _gate_db = _gate(levels_db, hop)
+
+    try:
+        import silero_vad_onnx
+        # The memmap, not _load's float32 copy of it: the resample reads this
+        # a block at a time and scales as it goes, so the only full-length
+        # array anyone allocates is the 16kHz one the model actually needs -
+        # a third the length and the one that gets pickled to the child
+        # anyway. _load here cost 2.76GB on a 2-hour track before the VAD had
+        # even started.
+        raw = np.memmap(decode_to_pcm(path), dtype=np.int16, mode="r")
+        intervals = silero_vad_onnx.speaking_intervals(raw, SAMPLE_RATE)
+    except Exception as exc:
+        if log:
+            log(f"  Silero VAD unavailable ({exc}); falling back to the energy gate")
+        intervals, _floor_db, _gate_db = _gate(levels_db, hop)
 
     if duration:
         intervals = [(max(0.0, s), min(duration, e)) for s, e in intervals

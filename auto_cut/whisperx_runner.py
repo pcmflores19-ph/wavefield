@@ -307,10 +307,14 @@ def _extract(whisperx_json):
 
 def transcribe(audio_path, model=DEFAULT_MODEL, language=DEFAULT_LANGUAGE,
                batch_size=DEFAULT_BATCH_SIZE, compute_type=None,
-               force=False, progress=None):
+               force=False, progress=None, should_cancel=None):
     """
     Returns {"words": [{"start","end","text"}...], "segments": [...]} for the
-    whole file, in seconds from the start of the recording.
+    whole file, in seconds from the start of the recording. Returns None
+    instead if should_cancel() becomes true partway through - a large model
+    on a long recording can run for a very long time on one file alone, so
+    cancellation is checked continuously against WhisperX's own streamed
+    output, not just between files.
     """
     dev = device()
     if compute_type is None:
@@ -348,17 +352,37 @@ def transcribe(audio_path, model=DEFAULT_MODEL, language=DEFAULT_LANGUAGE,
         # moment a non-cp1252 character appears - which Filipino output will
         # contain - killing the run mid-file. Force UTF-8 on both ends.
         env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
-        result = subprocess.run(
-            cmd, capture_output=True, text=True,
-            encoding="utf-8", errors="replace", env=env,
+        # Popen, not run() - a large model can take a very long time on one
+        # file alone, and run() gives back no handle to stop it early. stderr
+        # merged into stdout so the one stream can be polled for both
+        # progress and should_cancel, same pattern as video_export.render's
+        # ffmpeg loop.
+        process = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="replace", env=env,
+            bufsize=1,
         )
-        if result.returncode != 0:
-            tail = (result.stderr or result.stdout or "")[-1500:]
+        tail = []
+        try:
+            for line in process.stdout:
+                tail.append(line)
+                del tail[:-40]          # keep only enough to explain a failure
+                if should_cancel and should_cancel():
+                    process.terminate()
+                    process.wait(timeout=10)
+                    return None
+            process.wait()
+        finally:
+            if process.poll() is None:
+                process.kill()
+
+        if process.returncode != 0:
+            tail_text = "".join(tail)[-1500:]
             hint = ""
-            if "out of memory" in tail.lower():
+            if "out of memory" in tail_text.lower():
                 hint = ("\n\nThe GPU ran out of memory - lower the batch size, "
                         "or keep compute_type at int8.")
-            raise RuntimeError(f"whisperx failed on {audio_path}:\n{tail}{hint}")
+            raise RuntimeError(f"whisperx failed on {audio_path}:\n{tail_text}{hint}")
 
         base = os.path.splitext(os.path.basename(audio_path))[0]
         json_path = os.path.join(out_dir, base + ".json")
@@ -372,11 +396,6 @@ def transcribe(audio_path, model=DEFAULT_MODEL, language=DEFAULT_LANGUAGE,
     with open(cache_file, "w", encoding="utf-8") as f:
         json.dump(data, f)
     return data
-
-
-def transcribe_words(audio_path, **kwargs):
-    """Just the word timings - what the cut logic consumes."""
-    return transcribe(audio_path, **kwargs)["words"]
 
 
 @contextlib.contextmanager

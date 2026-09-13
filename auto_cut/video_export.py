@@ -114,7 +114,7 @@ def _filter_graph(segments, width, height, fps,
     return ";".join(parts)
 
 
-def _bookend_input(path, seconds, width, height, fps):
+def _bookend_input(path, seconds, width, height, fps, use_gpu=False):
     """
     ffmpeg input arguments for one bookend, and what kind it turned out to be.
 
@@ -129,7 +129,8 @@ def _bookend_input(path, seconds, width, height, fps):
             if info.has_video:
                 # Trimmed to the audio length so picture and sound agree even
                 # if the file is slightly longer.
-                return (["-t", f"{seconds:.6f}", "-i", path], "video")
+                hwaccel = ["-hwaccel", "cuda"] if use_gpu else []
+                return (hwaccel + ["-t", f"{seconds:.6f}", "-i", path], "video")
         except Exception:
             pass                         # unreadable: fall through to black
     return (["-f", "lavfi", "-t", f"{seconds:.6f}",
@@ -219,14 +220,21 @@ def render(video_path, audio_path, out_path, keep_ranges, crf=DEFAULT_CRF,
 
     rate = f"{float(info.fps):.6f}"
     intro_args, intro_kind = _bookend_input(intro_path, intro_seconds,
-                                            info.width, info.height, rate)
+                                            info.width, info.height, rate,
+                                            use_gpu=use_gpu)
     outro_args, outro_kind = _bookend_input(outro_path, outro_seconds,
-                                            info.width, info.height, rate)
+                                            info.width, info.height, rate,
+                                            use_gpu=use_gpu)
     if progress and (intro_kind == "video" or outro_kind == "video"):
         progress(0.0, "using the picture from your intro/outro")
 
+    # -hwaccel cuda moves decode onto the GPU too, so NVENC (below) isn't
+    # left waiting on a CPU-bound decode+filter stage - confirmed idle-ish
+    # (~30% Video Encode) without it, decode-bound rather than encode-bound.
     source_args = []
     for source in sources:
+        if use_gpu:
+            source_args += ["-hwaccel", "cuda"]
         source_args += ["-i", source]
 
     graph = _filter_graph(segments, info.width, info.height,
@@ -298,10 +306,13 @@ def render(video_path, audio_path, out_path, keep_ranges, crf=DEFAULT_CRF,
     if process.returncode != 0:
         message = "".join(tail)
         # A GPU encode can still fail after passing the probe - a driver
-        # update mid-session, another program holding the encoder. The CPU
-        # path is slower but always works, and is far better than handing
-        # someone an ffmpeg backtrace.
-        if use_gpu and "nvenc" in message.lower():
+        # update mid-session, another program holding the encoder, or now
+        # the -hwaccel cuda decode failing for a source the GPU decoder
+        # can't handle. The CPU path is slower but always works, and is far
+        # better than handing someone an ffmpeg backtrace.
+        lowered = message.lower()
+        if use_gpu and ("nvenc" in lowered or "cuda" in lowered
+                        or "hwaccel" in lowered):
             if progress:
                 progress(0.0, "GPU encoder unavailable - encoding on the "
                               "processor instead (slower)")

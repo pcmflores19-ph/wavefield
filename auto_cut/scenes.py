@@ -20,6 +20,9 @@ edition blocks the scripting API that would have made it work. This time the
 cut is rendered by us in the video export, where nothing can second-guess it.
 """
 
+import hashlib
+import random
+
 HOST, GUEST, BOTH = 0, 1, 2
 
 # Below this a shot is not a shot. Without it, a "mm-hm" in the middle of the
@@ -124,36 +127,80 @@ def _enforce_minimum(scenes, min_shot_seconds):
             return scenes
 
 
+def _shot_rng(camera, start, end):
+    """
+    A private RNG for one shot's split decisions, seeded from the shot's own
+    identity rather than a global generator - so recomputing scenes for an
+    unrelated reason never reshuffles cuts already made for this one. Uses
+    sha256 rather than Python's built-in hash(), which is salted per process
+    and would make the same shot split differently between runs.
+    """
+    key = f"{camera}:{start:.6f}:{end:.6f}"
+    seed = int(hashlib.sha256(key.encode()).hexdigest(), 16)
+    return random.Random(seed)
+
+
 def _enforce_maximum(scenes, max_shot_seconds, min_shot_seconds):
     """
-    Breaks up any shot that outstays its welcome with a cutaway to V3.
+    Breaks up any shot that outstays its welcome.
 
-    A single camera held for minutes reads as a stuck stream. The cutaway goes
-    to the merged shot because both people are in it - it is always a truthful
-    thing to cut to, whoever happens to be talking.
+    A long stretch on one camera is rebuilt as alternating solo/merged pairs:
+    a brief return to the person talking, then a longer hold on the merged
+    view, sized so the merged view reads as about 70% of the stretch and the
+    talking camera about 30% - the emphasis a long monologue should actually
+    have, not a brief cutaway to the merged shot in an otherwise-solo video.
+    Each piece is still bounded by max_shot_seconds on its own, so neither
+    camera can hold the screen indefinitely just because it is the majority
+    one. The draw is seeded from the shot's own (camera, start, end), so
+    recomputing scenes elsewhere on the timeline never reshuffles cuts
+    already made here.
 
     Shots already on V3 are left alone: there is nowhere more neutral to go.
     """
     if not max_shot_seconds or max_shot_seconds <= 0:
         return scenes
 
-    cutaway = max(1.0, min_shot_seconds)
+    # A 0 (or otherwise sub-1s) minimum is a valid setting for absorbing
+    # short reaction shots, but piece length shouldn't inherit it - drawing
+    # from [0, max] would let a 0.1s flicker of a shot through.
+    chunk_floor = min(max(1.0, min_shot_seconds), max_shot_seconds)
+    # The merged view holds the screen roughly 7x as long as each return to
+    # the talking camera - 70/30 expressed as a length ratio within each
+    # solo-then-merged pair, rather than decided cutaway by cutaway.
+    solo_ratio = 0.3 / 0.7
+
     out = []
     for camera, start, end in scenes:
         if camera == BOTH or (end - start) <= max_shot_seconds:
             out.append((camera, start, end))
             continue
+
+        rng = _shot_rng(camera, start, end)
         position = start
-        while (end - position) > max_shot_seconds:
-            out.append((camera, position, position + max_shot_seconds))
-            position += max_shot_seconds
-            # Never leave a stub shorter than the cutaway itself.
-            if (end - position) < cutaway * 2:
+        while position < end:
+            remaining = end - position
+            if remaining <= max_shot_seconds:
+                # Short enough to just be one more shot on the camera
+                # that's already talking - no need to force in a cutaway
+                # for a tail this short.
+                out.append((camera, position, end))
                 break
-            out.append((BOTH, position, position + cutaway))
-            position += cutaway
-        if end > position:
-            out.append((camera, position, end))
+
+            both_len = rng.uniform(chunk_floor, max_shot_seconds)
+            solo_len = max(chunk_floor, both_len * solo_ratio)
+            if 0 < remaining - (solo_len + both_len) < chunk_floor:
+                # Don't leave a dangling tail thinner than a piece is
+                # allowed to be after this pair - fold it into the merged
+                # piece instead.
+                both_len = remaining - solo_len
+
+            out.append((camera, position, position + solo_len))
+            position += solo_len
+            if position >= end:
+                break
+            both_len = min(both_len, end - position)
+            out.append((BOTH, position, position + both_len))
+            position += both_len
     return _merge_runs(out)
 
 

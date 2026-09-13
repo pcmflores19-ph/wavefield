@@ -17,7 +17,10 @@ PANEL_LIGHT = "#2e2e2e"   # raised controls
 BORDER = "#3a3a3a"
 TIMELINE_BG = "#141414"   # waveform / meter canvases
 TEXT = "#d8d8d8"
-TEXT_DIM = "#8c8c8c"
+# #8c8c8c measured ~4-4.6:1 against PANEL/PANEL_LIGHT - right at WCAG AA's
+# floor for normal text, which read as illegible in the effects window and
+# the toggle buttons next to the menu bar. Brightened for real headroom.
+TEXT_DIM = "#a8a8a8"
 ACCENT = "#e08a3c"        # Resolve's orange, for the active page and playhead
 ACCENT_DIM = "#8a5626"
 SELECT = "#2f5d8a"        # selection blue
