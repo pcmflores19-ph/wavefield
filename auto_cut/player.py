@@ -304,7 +304,7 @@ class Player:
                     ramp = np.linspace(0.0, 1.0, span, dtype=np.float32)
                     buf[lo:hi] *= ramp[lo - rs:hi - rs]
 
-            t.peak_level = float(np.abs(buf).max()) if buf.size else 0.0
+            t.peak_level = effects.true_peak(buf)
             t.rms_level = float(np.sqrt(np.mean(buf * buf))) if buf.size else 0.0
 
             out[:buf.size] += buf
@@ -341,14 +341,17 @@ class Player:
                 self._pos += take
                 filled += take
 
-        # Master level measured before limiting, so overs are visible.
-        self.master_peak = float(np.abs(out).max()) if out.size else 0.0
+        # Master level measured before limiting (true peak, so overs the
+        # limiter is about to catch - and overs a lossy export re-encode
+        # could add on top - are both visible), so overs are visible.
+        self.master_peak = effects.true_peak(out)
         self.master_rms = float(np.sqrt(np.mean(out * out))) if out.size else 0.0
 
-        if self.master_peak > 1.0:
+        ceiling = 10 ** (effects.LIMITER_CEILING_DB / 20.0)
+        if self.master_peak > ceiling:
             # Limit the loud moment instead of hard-clipping it, so what you
             # hear live matches what the export does to the same overlap.
-            out = effects.limiter(out, SAMPLE_RATE, threshold_db=0.0)
+            out = effects.limiter(out, SAMPLE_RATE, threshold_db=effects.LIMITER_CEILING_DB)
         np.clip(out, -1.0, 1.0, out=out)
         outdata[:, 0] = out
 

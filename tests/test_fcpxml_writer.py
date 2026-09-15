@@ -86,6 +86,11 @@ def test_build_fcpxml_scene_switching_adds_static_reference_picture_lanes():
     spine/speaker lanes - confirmed by direct Resolve import that reusing
     the audio-carrying asset (even with srcEnable="video"/adjust-volume)
     still left Resolve creating extra duplicate audio tracks.
+
+    Since camera_media[0]/[1] are host/guest's own video, already covered by
+    a dedicated picture lane, host/guest's own spine/connected clips are
+    audio-only here (no hasVideo) - 3 video tracks total (the camera lanes),
+    not 5.
     """
     host = _media("/recordings/host.mp4", 20.0)
     guest = _media("/recordings/guest.mp4", 20.0)
@@ -103,6 +108,9 @@ def test_build_fcpxml_scene_switching_adds_static_reference_picture_lanes():
     # - every picture-lane asset declares no audio at all.
     assert xml.count("<asset id=") == 5
     assert xml.count("hasAudio=") == 2
+    # host/guest's own assets (r1/r2) no longer declare video - only the 3
+    # camera-lane assets (r3/r4/r5) do, so the timeline has 3 video tracks.
+    assert xml.count('hasVideo="1"') == 3
 
     # The scene boundary splits the single keep range into 2 pieces, each
     # gaining 3 picture-lane clips (lanes 2/3/4, above the existing

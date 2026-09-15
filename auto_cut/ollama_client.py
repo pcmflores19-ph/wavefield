@@ -19,14 +19,6 @@ import urllib.request
 BASE_URL = "http://localhost:11434"
 
 
-def is_running(timeout=2.0):
-    try:
-        urllib.request.urlopen(f"{BASE_URL}/api/tags", timeout=timeout).read()
-        return True
-    except Exception:
-        return False
-
-
 def loaded_models(timeout=3.0):
     """
     Models Ollama currently has resident in VRAM.

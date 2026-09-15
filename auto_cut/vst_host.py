@@ -755,16 +755,19 @@ class TrackChain:
         parts = [("[" + s.name + "]") if s.bypassed else s.name for s in self.slots]
         return " -> ".join(parts) + ("" if self.enabled else "  (chain off)")
 
-    def process(self, audio, sample_rate, reset=False, log=None):
+    def process(self, audio, sample_rate, reset=False, log=None,
+               should_cancel=None):
         """
         Runs mono float32 `audio` (1-D) through the whole chain in ONE pass.
         See process_slots() below for the mechanics and the reasoning behind
         doing this in one pass rather than in blocks.
         """
-        return self.process_slots(audio, sample_rate, self.slots, reset, log)
+        return self.process_slots(audio, sample_rate, self.slots, reset, log,
+                                  should_cancel=should_cancel)
 
     def process_slots(self, audio, sample_rate, slots, reset=False, log=None,
-                      gate_timeout=_PROCESS_GATE_TIMEOUT_SECONDS):
+                      gate_timeout=_PROCESS_GATE_TIMEOUT_SECONDS,
+                      should_cancel=None):
         """
         Runs mono float32 `audio` (1-D) through exactly `slots` (bypassed
         entries among them are skipped, and the whole call is a no-op if this
@@ -808,6 +811,15 @@ class TrackChain:
         the audio callback must not log per block. `gate_timeout` lets realtime
         playback decline a block immediately when a plugin load is pending;
         offline callers retain the normal bounded wait.
+
+        `should_cancel`, if given, is checked once per plugin - between
+        whole-track passes, never mid-plugin-call. A single plugin's call
+        over an hour of audio is one opaque native call with no safe
+        interruption point (see the chunking note above: splitting it up
+        purely to poll a flag would reintroduce the same latency-compensation
+        misalignment chunking already exists to avoid). Audio already
+        processed by earlier slots when cancellation is observed is returned
+        as-is rather than discarded.
         """
         if not self.enabled:
             return audio
@@ -817,6 +829,8 @@ class TrackChain:
         buf = audio.reshape(1, -1)
         with _GATE.processing(timeout=gate_timeout), self._lock:
             for slot in slots:
+                if should_cancel and should_cancel():
+                    break
                 try:
                     with slot.lock:
                         if getattr(slot, "is_native", False):
@@ -847,15 +861,37 @@ class TrackChain:
         except Exception as exc:
             if log:
                 log(f"  {slot.name}: {exc}; retrying in chunks")
-            pieces = []
             step = int(sample_rate * CHUNK_SECONDS)
             # reset only on the first chunk: the plugin's state has to carry
-            # across the joins or every boundary becomes a click.
+            # across the joins or every boundary becomes a click. That same
+            # statefulness is why the output strategy below is decided ONCE,
+            # from chunk 0 only, and never switched mid-loop: if a later
+            # chunk came back an unexpected shape, discarding a pre-allocated
+            # buffer and "retrying" the whole plugin from chunk 0 in list
+            # mode would call process() a second time on a plugin whose
+            # internal envelope/compressor/gate state has already advanced
+            # once - producing silently different audio, not a safe retry.
+            out = None
             for index, offset in enumerate(range(0, length, step)):
                 piece = buf[:, offset:offset + step]
-                pieces.append(slot.plugin(piece, sample_rate,
-                                          reset=(reset and index == 0)))
-            out = numpy.concatenate(pieces, axis=1) if pieces else buf
+                result = slot.plugin(piece, sample_rate,
+                                     reset=(reset and index == 0))
+                if index == 0:
+                    if result.shape[1] != piece.shape[1]:
+                        raise RuntimeError(
+                            f"{slot.name}: chunked processing returned "
+                            f"{result.shape[1]} samples for a "
+                            f"{piece.shape[1]}-sample chunk; cannot safely "
+                            f"retry once the plugin's internal state has "
+                            f"already advanced")
+                    # Pre-allocate once chunk 0's shape is confirmed, instead
+                    # of building a list and numpy.concatenate-ing a second
+                    # full-length array at the end (real, avoidable memory
+                    # duplication on long tracks).
+                    out = numpy.empty_like(buf)
+                out[:, offset:offset + result.shape[1]] = result
+            if out is None:
+                out = buf
             if log:
                 log(f"  {slot.name}: applied in chunks")
 
@@ -885,8 +921,6 @@ class TrackChain:
         Loading fresh instances costs a second or two, which is nothing next to
         the work these callers are about to do anyway.
         """
-        import pedalboard
-
         copy = TrackChain()
         copy.enabled = self.enabled
         copy.slots = self._snapshot_slot_list(self.slots, log=log)

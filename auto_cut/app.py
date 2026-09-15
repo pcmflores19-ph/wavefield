@@ -73,17 +73,18 @@ ZOOM_STEP = 1.4
 METER_WIDTH = 68             # loudness meter columns either side of the waveform
 METER_FLOOR_DB = -60.0       # bottom of the meter scale
 METER_DECAY = 0.25           # how fast the bar falls back per UI tick
-PEAK_HOLD_TICKS = 18         # how long the peak marker sticks before dropping
+PEAK_HOLD_TICKS = 18         # how long the bar sticks at a peak before falling back
 
 FADER_MAX_DB = 12.0          # top of the mixer gain fader (shares the floor with the meters)
 
-# Classic three-zone level meter: green while there's headroom, yellow as it
-# gets loud, red where clipping is a real risk.
-METER_GREEN_MAX_DB = -12.0
-METER_YELLOW_MAX_DB = -3.0
-METER_GREEN = "#4caf50"       # Material Design green/amber/red 500 - the
-METER_YELLOW = "#ffc107"      # recognizable "default" traffic-light shades,
-METER_RED = "#f44336"         # picked for max contrast against the meter's near-black bar
+# Single true-peak bar, DaVinci Resolve style: green while there's headroom,
+# yellow/olive as it approaches the ceiling, red where clipping is a real
+# risk. Thresholds and colors match Resolve's own zone convention.
+METER_GREEN_MAX_DB = -18.0
+METER_YELLOW_MAX_DB = -6.0
+METER_GREEN = "#00A34A"       # Safe zone: dark kelly green
+METER_YELLOW = "#CBB000"      # Caution zone: olive-tinted mustard yellow
+METER_RED = "#D1232A"         # Clip zone: crimson / deep warning red
 METER_SCALE_TICKS = (0, -6, -12, -24, -40)
 
 LANE_COLORS = ["#57b9a6", "#c9a227", "#7a9ec2", "#c07ab8", "#9ec27a"]
@@ -759,6 +760,8 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
         self._sync_running = True
         self._set_action_state("syncing")
         self._start_busy("Syncing")
+        self._begin_modal_export(
+            "Syncing", "Rendering trimmed/padded copies of the recordings...")
         threading.Thread(target=self._sync_worker, args=(offsets,),
                          daemon=True).start()
 
@@ -769,6 +772,10 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
             new_paths = list(self.speaker_paths)
             any_changed = False
             for index, offset in offsets.items():
+                if self._export_cancelled():
+                    self.log("Sync cancelled.")
+                    self.root.after(0, self._sync_cancelled)
+                    return
                 if offset == 0.0:
                     continue
                 path = self.speaker_paths[index]
@@ -785,6 +792,7 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
         self._stop_busy()
         self._sync_running = False
         self._set_action_state(None)
+        self._end_modal_export()
         if any_changed:
             # Payload is the pre-sync speaker_paths, not a range like the
             # other edit kinds - undo_edit() restores it wholesale rather
@@ -795,10 +803,17 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
         else:
             self.log("Sync made no changes.")
 
+    def _sync_cancelled(self):
+        self._stop_busy()
+        self._sync_running = False
+        self._set_action_state(None)
+        self._end_modal_export()
+
     def _sync_failed(self, exc):
         self._stop_busy()
         self._sync_running = False
         self._set_action_state(None)
+        self._end_modal_export()
         messagebox.showerror("Sync failed", str(exc))
 
     def _analysis_done(self):
@@ -2136,22 +2151,16 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
         return METER_GREEN
 
     def _meter_state(self, key):
-        return self._meters.setdefault(key, {"bar": METER_FLOOR_DB,
-                                             "peak": METER_FLOOR_DB,
+        return self._meters.setdefault(key, {"peak": METER_FLOOR_DB,
                                              "hold": 0})
 
-    def _update_meter_state(self, key, rms, peak):
-        """Applies fall-back ballistics and peak-hold to one meter."""
+    def _update_meter_state(self, key, peak):
+        """Applies peak-hold ballistics to one meter's true-peak bar."""
         state = self._meter_state(key)
-        rms_db = self._to_db(rms)
         peak_db = self._to_db(peak)
 
-        # Bar rises instantly, falls gradually - standard meter behaviour.
-        if rms_db >= state["bar"]:
-            state["bar"] = rms_db
-        else:
-            state["bar"] += (rms_db - state["bar"]) * METER_DECAY
-
+        # Bar rises instantly, holds briefly at a peak, then falls back -
+        # standard peak-meter behaviour (DaVinci Resolve, most DAWs).
         if peak_db >= state["peak"]:
             state["peak"] = peak_db
             state["hold"] = PEAK_HOLD_TICKS
@@ -2164,8 +2173,8 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
     def _draw_meter(self, canvas, slots, scale=False):
         """
         slots: [(label, top_y, height, state)] - one vertical meter each.
-        Bars are drawn in green/yellow/red zones; the number under each bar is
-        the average (RMS) level in dBFS - the peak is the held line above it.
+        A single true-peak bar, drawn in green/yellow/red zones - the number
+        under each bar is the same peak reading the bar's height shows.
         """
         canvas.delete("all")
         width = int(canvas.winfo_width()) or METER_WIDTH
@@ -2186,7 +2195,7 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
                 return bar_bottom - self._db_to_fraction(db) * bar_height
 
             # Fill in zones, each clipped to how far the level actually reached.
-            level_db = state["bar"]
+            level_db = state["peak"]
             zones = [(METER_FLOOR_DB, METER_GREEN_MAX_DB, METER_GREEN),
                      (METER_GREEN_MAX_DB, METER_YELLOW_MAX_DB, METER_YELLOW),
                      (METER_YELLOW_MAX_DB, 0.0, METER_RED)]
@@ -2203,17 +2212,10 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
             for db in (METER_GREEN_MAX_DB, METER_YELLOW_MAX_DB):
                 canvas.create_line(x0, y_for(db), x1, y_for(db), fill="#555")
 
-            if state["peak"] > METER_FLOOR_DB:
-                peak_y = y_for(state["peak"])
-                canvas.create_line(x0, peak_y, x1, peak_y,
-                                   fill=self._level_color(state["peak"]), width=2)
-
-            # The number is the average (RMS) reading the bar itself shows -
-            # the peak is already visible as the held line above it.
-            reading = ("-inf" if state["bar"] <= METER_FLOOR_DB
-                       else f"{state['bar']:.1f}")
+            reading = ("-inf" if state["peak"] <= METER_FLOOR_DB
+                       else f"{state['peak']:.1f}")
             canvas.create_text(width / 2, bar_bottom + 9, text=reading,
-                               fill=self._level_color(state["bar"]),
+                               fill=self._level_color(state["peak"]),
                                font=("TkDefaultFont", 8, "bold"))
 
             if scale:
@@ -2231,7 +2233,7 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
         # Per-track meters, each aligned with its waveform lane.
         slots = []
         for i, track in enumerate(self.player.tracks):
-            state = self._update_meter_state(f"t{i}", track.rms_level, track.peak_level)
+            state = self._update_meter_state(f"t{i}", track.peak_level)
             slots.append((f"A{i + 1}", RULER_HEIGHT + i * LANE_HEIGHT,
                           LANE_HEIGHT, state))
         if int(self.track_meters.cget("height")) != height:
@@ -2244,8 +2246,7 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
         panel_height = self.canvas.winfo_height()
         if panel_height <= 1:
             panel_height = height
-        master = self._update_meter_state("master", self.player.master_rms,
-                                          self.player.master_peak)
+        master = self._update_meter_state("master", self.player.master_peak)
         if int(self.master_meter.cget("height")) != panel_height:
             self.master_meter.config(height=panel_height)
         self._draw_meter(self.master_meter,
@@ -2558,39 +2559,21 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
                          args=(path, keep_ranges), daemon=True).start()
 
     def _export_audio_worker(self, path, keep_ranges):
-        import time
         try:
             gains = [t.gain for t in self.player.tracks]
-            total = len(self.speaker_paths)
-            started = time.perf_counter()
-
-            def progress(message):
-                # export_audio names the file it is on; turn that into a real
-                # fraction and an estimate, rather than a bar swinging about
-                # telling the user nothing.
-                self.log(message)
-                done = sum(1 for p in self.speaker_paths
-                           if os.path.basename(p) in message)
-                for index, speaker in enumerate(self.speaker_paths):
-                    if os.path.basename(speaker) in message:
-                        fraction = (index + 0.5) / max(1, total)
-                        elapsed = time.perf_counter() - started
-                        remaining = ""
-                        if fraction > 0.05:
-                            left = elapsed / fraction - elapsed
-                            remaining = f" - about {self._format_eta(left)} left"
-                        self._export_step(
-                            f"{message}{remaining}", fraction * 0.9)
-                        return
-                self._export_step(message, None)
+            progress = self._track_render_progress(scale=0.9)
 
             written, peak = export_audio(
                 path, self.speaker_paths, keep_ranges,
                 mutes=self.effective_mutes(), chains=self.track_chains,
                 gains=gains, stems=self.export_stems.get(),
                 intro_path=self.intro_path, outro_path=self.outro_path,
-                progress=progress,
+                progress=progress, should_cancel=self._export_cancelled,
             )
+            if not written:
+                self.log("Audio export cancelled.")
+                self.root.after(0, self._export_cancelled_ui)
+                return
             self._export_step("Writing files...", 0.95)
             written += self._write_transcript_files(path, keep_ranges)
             total_seconds = sum(e - s for s, e in keep_ranges)
@@ -2602,16 +2585,82 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
             self.log(f"ERROR exporting audio: {exc}")
             self.root.after(0, lambda e=exc: self._export_audio_failed(e))
 
-    @staticmethod
-    def _format_eta(seconds):
-        seconds = max(0, int(seconds))
-        if seconds < 60:
-            return f"{seconds}s"
-        minutes, seconds = divmod(seconds, 60)
-        if minutes < 60:
-            return f"{minutes}m {seconds:02d}s"
-        hours, minutes = divmod(minutes, 60)
-        return f"{hours}h {minutes:02d}m"
+    def _track_render_progress(self, scale=1.0):
+        """
+        A `progress(message)` callback for render_tracks/export_audio's
+        text-message progress reporting, translating it into a real
+        fraction and ETA - shared by `_render_mix` (video export's audio
+        phase) and `_export_audio_worker` (the WAV export), which used to
+        each carry their own copy of this logic, with the same bug: a
+        fraction of `(index + 0.5) / track_count` assumes every track
+        costs the same to decode+process, which breaks the moment one
+        track is longer or has a heavier VST chain than another - and got
+        worse once render_tracks started running multiple tracks
+        concurrently, since a fraction keyed only to "which track is this
+        message about" can jump backward the instant a later track's
+        message reaches this callback before an earlier one's does.
+
+        Instead, every track carries its own STAGE (0..1, monotonically
+        non-decreasing) inferred from its own messages - being mentioned
+        at all counts a little, "processing" through its VST chain counts
+        more, and the explicit "finished" message render_tracks now sends
+        (see its render_one) pins it at 1.0. The overall fraction is the
+        duration-weighted sum (self._audio_durations, each track's own
+        real length - a 2-minute track and a 2-hour track do not deserve
+        equal weight) of every track's own stage, so it can only increase
+        as work genuinely completes, regardless of which track's message
+        happens to arrive next - safe under render_tracks' own
+        parallelism, unlike the old index-based version.
+
+        A message that doesn't name any track (e.g. "mix peaked...",
+        "adding intro...") still updates the dialog with the last known
+        fraction instead of dropping to an indeterminate spinner - that
+        flicker was a second, separate symptom of the old per-message
+        fraction-or-None logic.
+
+        The "processing X through Y" stage can genuinely run for a long
+        time with NO further progress messages at all - a healthy VST
+        chain's `TrackChain.process_slots` (vst_host.py) only calls its
+        `log` callback on an error/chunk-fallback/mismatch, never on the
+        ordinary per-plugin success path, and even then never with the
+        track's own name in the message (confirmed 2026-09-14). So this
+        stage's weight can sit flat while wall-clock time keeps passing -
+        any "time left" estimate derived from it would be unreliable, so
+        this only ever shows a percentage, never a time estimate.
+
+        `scale` compresses the whole fraction into a sub-range -
+        `_export_audio_worker` reserves the last 10% for writing files.
+        """
+        speakers = list(self.speaker_paths)
+        durations = (list(self._audio_durations)
+                    if len(self._audio_durations) == len(speakers)
+                    else [1.0] * len(speakers))
+        total_duration = sum(durations) or 1.0
+        weights = [d / total_duration for d in durations]
+        stage = [0.0] * len(speakers)
+        lock = threading.Lock()
+
+        def stage_for(message):
+            lowered = message.lower()
+            if "finished" in lowered:
+                return 1.0
+            if "processing" in lowered:
+                return 0.6
+            if "decoding" in lowered:
+                return 0.2
+            return 0.05          # e.g. the initial "Rendering X..." message
+
+        def progress(message):
+            self.log(message)
+            with lock:
+                for index, speaker in enumerate(speakers):
+                    if os.path.basename(speaker) in message:
+                        stage[index] = max(stage[index], stage_for(message))
+                        break
+                fraction = sum(w * s for w, s in zip(weights, stage)) * scale
+            self._export_step(message, fraction)
+
+        return progress
 
     # ---------- exports run behind a modal dialog ----------
 
@@ -2684,7 +2733,7 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
         import tempfile
         import time
         import video_export
-        from audio_export import write_wav
+        from audio_export import limit_to_ceiling, write_wav
 
         temp_wav = None
         try:
@@ -2703,18 +2752,21 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
                 raise KeyboardInterrupt
 
             # Intro and outro go on last, at their own level, exactly as the
-            # WAV export does - so the two exports sound identical.
+            # WAV export does - so the two exports sound identical. They get
+            # the same -1 dBTP safety ceiling as the mix, independently, so
+            # mastered music parked at 0 dBFS doesn't clip on the AAC mux
+            # below even though nothing here ever reads a sample over 1.0.
             intro_seconds = outro_seconds = 0.0
             bookends = []
             if self.intro_path:
                 self._export_step("Adding intro...", None)
-                intro = decode_audio_file(self.intro_path)
+                intro = limit_to_ceiling(decode_audio_file(self.intro_path))
                 intro_seconds = intro.size / PLAYER_SAMPLE_RATE
                 bookends.append(intro)
             bookends.append(mix)
             if self.outro_path:
                 self._export_step("Adding outro...", None)
-                outro = decode_audio_file(self.outro_path)
+                outro = limit_to_ceiling(decode_audio_file(self.outro_path))
                 outro_seconds = outro.size / PLAYER_SAMPLE_RATE
                 bookends.append(outro)
             if len(bookends) > 1:
@@ -2750,7 +2802,7 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
 
             if result is None:
                 self.log("Video export cancelled.")
-                self.root.after(0, self._export_video_cancelled)
+                self.root.after(0, self._export_cancelled_ui)
                 return
 
             extra = self._write_transcript_files(path, keep_ranges)
@@ -2760,7 +2812,7 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
             self.root.after(0, lambda: self._export_video_done(path, extra))
         except KeyboardInterrupt:
             self.log("Video export cancelled.")
-            self.root.after(0, self._export_video_cancelled)
+            self.root.after(0, self._export_cancelled_ui)
         except Exception as exc:
             self.log(f"ERROR exporting video: {exc}")
             self.root.after(0, lambda e=exc: self._export_failed(e))
@@ -2773,15 +2825,11 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
 
     def _render_mix(self, keep_ranges, gains):
         """The summed, processed, cut audio - what export_audio writes."""
-        import numpy as np
         import effects
         from audio_export import render_tracks
         from player import SAMPLE_RATE
 
-        def progress(message):
-            self.log(message)
-            if message.startswith("Rendering "):
-                self._export_step(message, None)
+        progress = self._track_render_progress()
 
         # Tracks render in parallel (up to render_tracks's own worker cap) -
         # see its docstring for why that's safe - but are still summed in a
@@ -2789,17 +2837,29 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
         mix, _rendered = render_tracks(self.speaker_paths, keep_ranges,
                                        mutes=self.effective_mutes(),
                                        chains=self.track_chains, gains=gains,
-                                       progress=progress)
+                                       progress=progress,
+                                       should_cancel=self._export_cancelled)
 
+        # Chunked so a long episode's true-peak pass never holds the whole
+        # mix and its oversampled copy in memory at once. True peak's
+        # interpolation only ever looks at neighboring samples, so this
+        # introduces at most one negligible, bounded edge estimate per chunk
+        # boundary - the same tradeoff the old chunked sample-peak loop here
+        # already accepted, not a new one.
         peak = 0.0
         for start in range(0, mix.size, 1 << 22):
-            peak = max(peak, float(np.abs(mix[start:start + (1 << 22)]).max()))
-        if peak > 1.0:
+            peak = max(peak, effects.true_peak(mix[start:start + (1 << 22)]))
+        ceiling = 10 ** (effects.LIMITER_CEILING_DB / 20.0)
+        if peak > ceiling:
             # Limit the loud moments instead of turning the whole episode
             # down for one overlap - matches live monitoring and the WAV
             # export (audio_export.py's export_audio), so video export
-            # sounds the same as both instead of coming out quieter.
-            mix = effects.limiter(mix, SAMPLE_RATE, threshold_db=0.0)
+            # sounds the same as both instead of coming out quieter. The
+            # ceiling sits at -1 dBTP rather than 0 dBFS so the AAC re-encode
+            # video_export.py does at mux time has headroom to reconstruct
+            # inter-sample overshoot without exceeding full scale on decode
+            # (see effects.LIMITER_CEILING_DB).
+            mix = effects.limiter(mix, SAMPLE_RATE, threshold_db=effects.LIMITER_CEILING_DB)
         return mix
 
     def _export_video_done(self, path, extra):
@@ -2809,7 +2869,13 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
                                                  for p in extra)) if extra else ""
         messagebox.showinfo("Exported", f"Saved:\n{path}{note}")
 
-    def _export_video_cancelled(self):
+    def _export_cancelled_ui(self):
+        """
+        Shared "close the modal dialog and re-enable export" handler for any
+        export-style operation cancelled mid-run - video, audio, and the
+        FCPXML/bake path all funnel here rather than each keeping their own
+        copy of the same two calls.
+        """
         self._end_modal_export()
         self._set_export_enabled(True)
 
@@ -2861,6 +2927,10 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
             if self.bake_effects.get():
                 media, mutes = self._bake_media_for_timeline(path, mutes)
                 baked_dir = os.path.splitext(path)[0] + "_media"
+                if self._export_cancelled():
+                    self.log("Timeline export cancelled.")
+                    self.root.after(0, self._export_cancelled_ui)
+                    return
 
             # Camera-switching picture lanes, mirroring export_segments'
             # (video export's) own use of the same scene data. V1/V2 are
@@ -2913,7 +2983,8 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
 
         baked = bake_processed_media(
             self.speaker_paths, out_dir, mutes=mutes, chains=self.track_chains,
-            gains=gains, progress=progress)
+            gains=gains, progress=progress,
+            should_cancel=self._export_cancelled)
         self.log(f"Baked {len(baked)} file(s) into {os.path.basename(out_dir)}")
         return [probe(p) for p in baked], []
 

@@ -177,7 +177,12 @@ def build_fcpxml(speaker_media, keep_ranges, project_name="Podcast (Wavefield)",
     rearrange clips in an earlier attempt (see scenes.py's module docstring).
 
     Without both scenes and camera_media (the default, and every pre-existing
-    caller), output is unchanged from before this parameter existed.
+    caller), output is unchanged from before this parameter existed. When
+    camera_media IS given, speaker_media[0]/[1]'s own spine/connected clips
+    drop their video (kept audio-only) since camera_media[0]/[1] already
+    cover their picture via a dedicated lane - so the timeline ends up with
+    3 video tracks (the camera lanes) instead of 5 (2 redundant speaker
+    picture tracks plus the 3 camera lanes).
     Returns the FCPXML document as a string.
     """
     if not speaker_media:
@@ -222,14 +227,14 @@ def build_fcpxml(speaker_media, keep_ranges, project_name="Podcast (Wavefield)",
     }
     base_tc = tc_frames[speaker_media[0].path]
 
-    def asset_resource_xml(asset_id, media, include_audio=True):
+    def asset_resource_xml(asset_id, media, include_audio=True, include_video=True):
         # An asset's own start and duration are in ITS OWN timebase, which is
         # not the sequence's when speakers were shot on cameras running at
         # different rates.
         own_fps = media.fps
         total_frames = int(round(media.duration_seconds * float(own_fps)))
         name = escape(os.path.splitext(os.path.basename(media.path))[0])
-        video_attrs = ' hasVideo="1" format="r0"' if media.has_video else ""
+        video_attrs = ' hasVideo="1" format="r0"' if (include_video and media.has_video) else ""
         audio_attrs = ""
         if include_audio and media.has_audio:
             audio_attrs = (
@@ -251,11 +256,21 @@ def build_fcpxml(speaker_media, keep_ranges, project_name="Podcast (Wavefield)",
             f'    </asset>'
         )
 
+    # When camera_media is given, its first two entries are required (by this
+    # function's own docstring/every caller) to be the SAME objects as
+    # speaker_media[0]/[1] - so those two speakers' picture is already
+    # carried by a dedicated camera lane below. Declaring it a second time on
+    # their own spine/connected clip only added a redundant, unused video
+    # track (V1/V2) on top of the picture lanes (which land on V1/V2/V3 once
+    # these two stop taking a track of their own) - so their asset drops
+    # hasVideo and keeps only hasAudio. Any speaker beyond the first two (no
+    # current caller has one) keeps its own video, since nothing else covers it.
     asset_ids = {}
     for i, media in enumerate(speaker_media, start=1):
         asset_id = f"r{i}"
         asset_ids[media.path] = asset_id
-        resources.append(asset_resource_xml(asset_id, media))
+        include_video = not (camera_media and i <= 2)
+        resources.append(asset_resource_xml(asset_id, media, include_video=include_video))
 
     # Every picture lane gets its OWN video-only asset, declared with no
     # audio at all - even for V1/V2, which already have a full audio-

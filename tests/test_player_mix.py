@@ -13,6 +13,7 @@ being silently ignored.
 import numpy as np
 import pytest
 
+import effects
 import player
 import vst_host
 
@@ -56,6 +57,48 @@ def test_empty_chain_does_not_error(track):
     # not try to process through an empty list.
     raw = np.asarray(track.samples[:1024]).astype(np.float32) / 32768.0
     assert np.array_equal(mix_block(track), raw)
+
+
+def test_mix_into_sets_track_peak_level_from_true_peak(track):
+    # A sub-Nyquist sine, phased so no discrete sample lands exactly on its
+    # peak (same genuine inter-sample-overshoot construction as
+    # test_effects.py's true_peak tests) - so the true-peak reading is
+    # provably higher than a plain sample-peak read of the same mixed
+    # output. peak_level feeds both the main mixer's per-track meter and the
+    # effects/plugin-chain dialog meter (fx_dialog.py), so this one value
+    # covers both.
+    n = player.SAMPLE_RATE * 3
+    f = 0.3 * player.SAMPLE_RATE / 2
+    t = np.arange(n) / player.SAMPLE_RATE
+    track.samples = (32000 * np.sin(2 * np.pi * f * t + 0.37)).astype(np.int16)
+
+    out = mix_block(track)
+    sample_peak = float(np.abs(out).max())
+
+    assert track.peak_level > sample_peak
+    assert track.peak_level == pytest.approx(effects.true_peak(out))
+
+
+def test_callback_master_peak_uses_true_peak(track, monkeypatch):
+    calls = []
+    real_true_peak = effects.true_peak
+
+    def spy(samples, *args, **kwargs):
+        calls.append(samples)
+        return real_true_peak(samples, *args, **kwargs)
+
+    monkeypatch.setattr(effects, "true_peak", spy)
+
+    p = player.Player()
+    p.tracks = [track]
+    p.duration = track.samples.size / player.SAMPLE_RATE
+    p.edited_mode = False
+
+    outdata = np.zeros((1024, 1), dtype=np.float32)
+    p._callback(outdata, 1024, None, None)
+
+    assert calls, "Player._callback did not call effects.true_peak"
+    assert p.master_peak == pytest.approx(real_true_peak(calls[-1]))
 
 
 def test_reset_reaches_the_chain_and_changes_the_result(track):

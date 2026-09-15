@@ -11,6 +11,7 @@ import os
 import tkinter as tk
 from tkinter import messagebox, ttk
 
+import effects
 import help_text
 import links
 import ui_theme
@@ -661,8 +662,9 @@ class UIBuilderMixin:
         self.track_meters.pack(side="left", fill="y")
         ui_theme.attach_tooltip(
             self.track_meters,
-            "Bar = average level (RMS). Line = the loudest recent instant "
-            "(peak-hold), measured after this track's own effects and fader.")
+            "True-peak meter (peak-hold), measured after this track's own "
+            "effects and fader - catches inter-sample overs a plain sample "
+            "reading would miss.")
         self.master_meter = tk.Canvas(wave_row, width=METER_WIDTH,
                                       height=LANE_HEIGHT + RULER_HEIGHT,
                                       background=ui_theme.TIMELINE_BG,
@@ -670,10 +672,12 @@ class UIBuilderMixin:
         self.master_meter.pack(side="right", fill="y")
         ui_theme.attach_tooltip(
             self.master_meter,
-            "Bar = average level (RMS). Line = the loudest recent instant, "
-            "measured BEFORE the safety limiter - so it can flag a moment "
-            "that would have clipped even though the limiter caught it and "
-            "what you actually hear/export never clipped.")
+            "True-peak meter (peak-hold), estimating inter-sample overs a "
+            "plain sample reading would miss - the kind a lossy export "
+            "re-encode can expose. Measured BEFORE the safety limiter "
+            f"engages at {effects.LIMITER_CEILING_DB:.0f} dBTP - so it can "
+            "flag a moment the limiter is about to catch, even though what "
+            "you actually hear/export stays under that ceiling.")
         # Vertical scrollbar for the lanes. Every speaker gets a LANE_HEIGHT
         # lane, so four tracks need ~315px - more than the timeline pane has at
         # its default size. Without this the pane simply clipped after the

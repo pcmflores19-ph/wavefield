@@ -24,6 +24,18 @@ import numpy as np
 # digital silence.
 VOL_MIN_DB = -96.0
 
+# -1 dBTP, not 0 dBFS: every safety-limiter call site in the app (player.py's
+# live monitoring, app.py's video-export mix, audio_export.py's WAV export)
+# ceilings to this instead of full scale, so a lossy re-encode downstream
+# (video_export.py mixes the final export to AAC) has headroom to reconstruct
+# inter-sample overshoot without exceeding 0 dBFS on decode - AAC routinely
+# overshoots material parked at exactly 0 dBFS by 1-3 dB once decoded, which
+# is what DaVinci Resolve then plays back as audible clipping even though
+# nothing in this app ever showed a sample over 1.0. Matches the ~-1 dBTP
+# headroom broadcast delivery specs (EBU R128 / ATSC A/85) require before
+# lossy delivery.
+LIMITER_CEILING_DB = -1.0
+
 
 def _gain_coefficient(sample_rate, seconds):
     if seconds <= 0:
@@ -224,6 +236,50 @@ def limiter(samples, sample_rate, threshold_db=-6.0, release_ms=60.0,
     release_gain = _gain_coefficient(sample_rate, release_ms / 1000.0)
     return _apply_envelope_gain(samples, attack_gain, release_gain,
                                 threshold_db, 1.0, state=state)
+
+
+def true_peak(samples, oversample=4):
+    """
+    Approximates true (inter-sample) peak: reconstructs `samples` at
+    `oversample`x its rate via zero-padded-spectrum (bandlimited) FFT
+    interpolation and returns the peak of THAT, rather than of the raw
+    samples. A plain `np.abs(samples).max()` only ever looks at the actual
+    sample points, so it can miss a peak the real waveform reaches BETWEEN
+    two samples - exactly the kind of overshoot a lossy codec's
+    reconstruction (e.g. AAC on video export) can expose even when every
+    original sample was at or under 1.0. Catching it here, in the same
+    number every meter and every limiter decision uses, is what lets the
+    app's own meters and safety limiting agree with what a decoder (and
+    DaVinci Resolve) will actually play back.
+
+    IMPORTANT: this has to be a bandlimited reconstruction, not a plain
+    linear interpolation - linear interpolation is monotonic between any
+    two points, so it can *never* read higher than the surrounding samples
+    and therefore can never actually detect inter-sample overshoot (the
+    first version of this function made exactly that mistake; caught by
+    its own test failing, not by inspection).
+
+    This is a lightweight numpy-only approximation of ITU-R BS.1770
+    true-peak metering, which specifies a steeper polyphase FIR - good
+    enough to catch material parked at/near full scale, not a
+    broadcast-certified true-peak meter. Treating each call's input as one
+    period (required by the FFT) rather than a slice of a longer continuous
+    signal can read up to ~1 dB high right at a block's edges, measured
+    empirically on ordinary program material - always on the safe/
+    conservative side (never measured to under-report a genuine peak),
+    which is the direction that matters for a safety limiter.
+    """
+    if samples.size == 0:
+        return 0.0
+    n = samples.size
+    if n < 2:
+        return float(np.abs(samples).max())
+    spectrum = np.fft.rfft(samples)
+    upsampled_n = n * oversample
+    padded = np.zeros(upsampled_n // 2 + 1, dtype=spectrum.dtype)
+    padded[:spectrum.size] = spectrum
+    upsampled = np.fft.irfft(padded, n=upsampled_n) * oversample
+    return float(np.abs(upsampled).max())
 
 
 def expander(samples, sample_rate, threshold_db=-40.0, ratio=2.0,

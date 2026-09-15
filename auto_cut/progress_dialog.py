@@ -54,9 +54,16 @@ class ProgressDialog(tk.Toplevel):
                                  wraplength=430, justify="left")
         self.message.pack(anchor="w")
 
-        self.bar = ttk.Progressbar(frame, mode="indeterminate", length=440)
-        self.bar.pack(fill="x", pady=(10, 6))
+        bar_row = ttk.Frame(frame, style="Panel.TFrame")
+        bar_row.pack(fill="x", pady=(10, 6))
+
+        self.bar = ttk.Progressbar(bar_row, mode="indeterminate", length=440)
+        self.bar.pack(side="left", fill="x", expand=True)
         self.bar.start(12)
+
+        self.percent = ttk.Label(bar_row, text="", style="Panel.TLabel", width=5,
+                                 anchor="e")
+        self.percent.pack(side="right", padx=(8, 0))
 
         self.detail = ttk.Label(frame, text="", style="PanelDim.TLabel",
                                 wraplength=430, justify="left")
@@ -98,7 +105,9 @@ class ProgressDialog(tk.Toplevel):
             if str(self.bar["mode"]) != "determinate":
                 self.bar.stop()
                 self.bar.config(mode="determinate", maximum=1000)
-            self.bar["value"] = max(0.0, min(1.0, fraction)) * 1000
+            clamped = max(0.0, min(1.0, fraction))
+            self.bar["value"] = clamped * 1000
+            self.percent.config(text=f"{clamped * 100:.0f}%")
 
     @property
     def closed(self):

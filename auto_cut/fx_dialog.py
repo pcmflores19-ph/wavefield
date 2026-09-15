@@ -13,15 +13,12 @@ exactly what their parameters mean.
 import math
 import os
 
-import numpy as np
 import tkinter as tk
 from tkinter import messagebox, ttk
 
 import effects
-import player
 import value_entry
 import ui_theme
-import vst_host
 from vst_host import discover_plugins, open_editor_subprocess
 
 # The size the dialog opens at. Named because centring has to work them out
@@ -45,11 +42,11 @@ METER_WIDTH = 68
 METER_FLOOR_DB = -60.0
 METER_DECAY = 0.25
 PEAK_HOLD_TICKS = 18
-METER_GREEN_MAX_DB = -12.0
-METER_YELLOW_MAX_DB = -3.0
-METER_GREEN = "#4caf50"
-METER_YELLOW = "#ffc107"
-METER_RED = "#f44336"
+METER_GREEN_MAX_DB = -18.0
+METER_YELLOW_MAX_DB = -6.0
+METER_GREEN = "#00A34A"       # Safe zone: dark kelly green - kept in sync
+METER_YELLOW = "#CBB000"      # Caution zone: olive-tinted mustard yellow -
+METER_RED = "#D1232A"         # Clip zone: crimson - with app.py's meters
 METER_SCALE_TICKS = (0, -6, -12, -24, -40)
 METER_TICK_MS = 60  # matches app.py's own _tick interval
 
@@ -215,18 +212,12 @@ class FxDialog(tk.Toplevel):
     def _meter_tick(self):
         if self._closed_check():
             return
-        rms = self.track.rms_level if self.track is not None else 0.0
         peak = self.track.peak_level if self.track is not None else 0.0
-        rms_db = self._to_db(rms)
         peak_db = self._to_db(peak)
 
         state = self._meter_state
-        # Rises instantly, falls gradually - same ballistics as the main
-        # mixer's meters (app.py._update_meter_state).
-        if rms_db >= state["bar"]:
-            state["bar"] = rms_db
-        else:
-            state["bar"] += (rms_db - state["bar"]) * METER_DECAY
+        # Rises instantly, holds briefly, falls gradually - same ballistics
+        # as the main mixer's meters (app.py._update_meter_state).
         if peak_db >= state["peak"]:
             state["peak"] = peak_db
             state["hold"] = PEAK_HOLD_TICKS
@@ -260,7 +251,7 @@ class FxDialog(tk.Toplevel):
             return bar_bottom - self._db_to_fraction(db) * bar_height
 
         state = self._meter_state
-        level_db = state["bar"]
+        level_db = state["peak"]
         zones = [(METER_FLOOR_DB, METER_GREEN_MAX_DB, METER_GREEN),
                  (METER_GREEN_MAX_DB, METER_YELLOW_MAX_DB, METER_YELLOW),
                  (METER_YELLOW_MAX_DB, 0.0, METER_RED)]
@@ -276,21 +267,16 @@ class FxDialog(tk.Toplevel):
         for db in (METER_GREEN_MAX_DB, METER_YELLOW_MAX_DB):
             canvas.create_line(x0, y_for(db), x1, y_for(db), fill="#555")
 
-        if state["peak"] > METER_FLOOR_DB:
-            peak_y = y_for(state["peak"])
-            canvas.create_line(x0, peak_y, x1, peak_y,
-                               fill=self._level_color(state["peak"]), width=2)
-
         for db in METER_SCALE_TICKS:
             y = y_for(db)
             canvas.create_line(x1, y, x1 + 3, y, fill="#666")
             canvas.create_text(x1 + 5, y, text=f"{db}", fill="#888",
                                anchor="w", font=("TkDefaultFont", 6))
 
-        reading = ("-inf" if state["bar"] <= METER_FLOOR_DB
-                   else f"{state['bar']:.1f}")
+        reading = ("-inf" if state["peak"] <= METER_FLOOR_DB
+                   else f"{state['peak']:.1f}")
         canvas.create_text(width / 2, bar_bottom + 10, text=reading,
-                           fill=self._level_color(state["bar"]),
+                           fill=self._level_color(state["peak"]),
                            font=("TkDefaultFont", 8, "bold"))
 
     # ---------- layout ----------
@@ -402,7 +388,7 @@ class FxDialog(tk.Toplevel):
         self.meter_canvas = tk.Canvas(meter_frame, width=METER_WIDTH,
                                       height=320, bg="#1a1a1a", highlightthickness=0)
         self.meter_canvas.pack(fill="y", expand=True, padx=4, pady=4)
-        self._meter_state = {"bar": METER_FLOOR_DB, "peak": METER_FLOOR_DB, "hold": 0}
+        self._meter_state = {"peak": METER_FLOOR_DB, "hold": 0}
         self._meter_job = self.after(METER_TICK_MS, self._meter_tick)
 
         # Sliders for whichever built-in effect is selected. Empty for a VST3,
@@ -594,9 +580,15 @@ class FxDialog(tk.Toplevel):
                               command=lambda _v, v=var, c=commit: c(v.get()))
             scale.grid(row=row, column=1, sticky="ew", padx=8)
 
+            def reset_to_default(_event=None, v=var, d=default, c=commit):
+                v.set(d)
+                c(d)
+
+            scale.bind("<Double-Button-1>", reset_to_default)
+
             # A slider is fine for a rough sweep and hopeless for "-18".
             entry = value_entry.attach(grid, var, lo, hi, on_commit=commit,
-                                       width=7)
+                                       width=7, fmt=lambda v: f"{v:.2f}")
             entry.grid(row=row, column=2, sticky="e")
 
             ttk.Label(grid, text=unit, width=5,

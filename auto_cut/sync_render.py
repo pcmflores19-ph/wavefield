@@ -15,7 +15,7 @@ import subprocess
 import bundled
 import settings
 from media_probe import probe
-from video_export import has_nvenc
+from video_export import has_nvenc, cpu_video_codec
 
 FFMPEG = bundled.tool("ffmpeg")
 
@@ -26,11 +26,13 @@ FFMPEG = bundled.tool("ffmpeg")
 _CRF = 18
 
 
-def _video_codec():
+def _video_codec(width, height, fps):
     if has_nvenc():
         return ["-c:v", "h264_nvenc", "-preset", "p4",
                 "-rc", "vbr", "-cq", str(_CRF), "-b:v", "0"]
-    return ["-c:v", "libx264", "-preset", "medium", "-crf", str(_CRF)]
+    # libopenh264, not libx264 - see video_export.cpu_video_codec's
+    # docstring: this bundled ffmpeg build has no libx264 at all.
+    return cpu_video_codec(width, height, fps)
 
 
 def _synced_cache_path(path, offset_seconds, has_video):
@@ -70,12 +72,16 @@ def render_synced_copy(path, offset_seconds, log=None):
     silence (and black video, if there's a picture stream) onto it. Returns
     the copy's path. Raises RuntimeError with ffmpeg's stderr on failure.
     """
-    has_video = probe(path).has_video
+    info = probe(path)
+    has_video = info.has_video
     out_path = _synced_cache_path(path, offset_seconds, has_video)
     if os.path.exists(out_path):
         if log:
             log(f"  using cached sync copy of {os.path.basename(path)}")
         return out_path
+
+    video_codec = (_video_codec(info.width, info.height, info.fps)
+                  if has_video else [])
 
     # pcm_s16le, not aac/copy: this derived file is the new working source
     # for everything downstream (same reasoning bake_processed_media uses
@@ -90,7 +96,7 @@ def render_synced_copy(path, offset_seconds, log=None):
             FFMPEG, "-y", "-v", "error",
             "-ss", f"{offset_seconds:.6f}",     # after -i: accurate, not keyframe-snapped
             "-i", path,
-            *(_video_codec() if has_video else []), *audio_codec,
+            *video_codec, *audio_codec,
             out_path,
         ]
     elif offset_seconds < 0:
@@ -104,7 +110,7 @@ def render_synced_copy(path, offset_seconds, log=None):
                 f"[0:a]adelay={delay_ms}:all=1[a]"
             )
             maps = ["-map", "[v]", "-map", "[a]"]
-            codec = _video_codec()
+            codec = video_codec
         else:
             filt = f"[0:a]adelay={delay_ms}:all=1[a]"
             maps = ["-map", "[a]"]
@@ -123,7 +129,7 @@ def render_synced_copy(path, offset_seconds, log=None):
         # exactly the assumption that just broke for .mp3.
         cmd = [
             FFMPEG, "-y", "-v", "error", "-i", path,
-            *(_video_codec() if has_video else []), *audio_codec,
+            *video_codec, *audio_codec,
             out_path,
         ]
 

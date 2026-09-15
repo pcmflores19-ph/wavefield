@@ -80,9 +80,17 @@ def reference_export(path_map, out_path, names, keeps, mutes, chains, gains,
     for audio in rendered:
         mix[:audio.size] += audio
 
-    peak = float(np.abs(mix).max()) if mix.size else 0.0
-    if peak > 1.0:
-        mix = effects.limiter(mix, 48000, threshold_db=0.0)
+    # Chunked exactly like audio_export.export_audio's own peak pass (same
+    # _STREAM_BLOCK size) - true_peak's FFT reconstruction is sensitive to
+    # where a block's edges fall, so a whole-array call here would read
+    # slightly differently at chunk boundaries and could disagree with the
+    # real, chunked implementation right at the ceiling.
+    peak = 0.0
+    for start in range(0, mix.size, audio_export._STREAM_BLOCK):
+        peak = max(peak, effects.true_peak(mix[start:start + audio_export._STREAM_BLOCK]))
+    ceiling = 10 ** (effects.LIMITER_CEILING_DB / 20.0)
+    if peak > ceiling:
+        mix = effects.limiter(mix, 48000, threshold_db=effects.LIMITER_CEILING_DB)
 
     bookends = []
     if intro is not None:
@@ -172,6 +180,93 @@ def test_export_is_byte_identical_with_a_chain(speakers, tmp_path):
     assert digest(want[0]) == digest(got[0])
 
 
+def test_render_tracks_stops_submitting_once_cancelled(speakers):
+    """
+    A should_cancel that trips stops render_tracks from queuing further
+    tracks - already in-flight tracks (up to max_workers) still finish and
+    are folded into the result, but the function does not silently render
+    every track regardless of the flag.
+    """
+    path_map, names = speakers
+    calls = []
+
+    def should_cancel():
+        # Cancel as soon as the first track has been queued for render.
+        return len(calls) >= 1
+
+    def counting_progress(message):
+        if message.startswith("Rendering "):
+            calls.append(message)
+
+    mix, _ = audio_export.render_tracks(
+        names, KEEPS, mutes=MUTES, gains=GAINS, max_workers=1,
+        progress=counting_progress, should_cancel=should_cancel)
+
+    # Only the first (already in-flight, max_workers=1) track was rendered;
+    # the rest were skipped rather than queued after cancellation.
+    assert len(calls) == 1
+    assert mix is not None
+
+
+def test_export_audio_writes_nothing_when_cancelled(speakers, tmp_path):
+    """
+    export_audio must not leave a truncated mixdown (or stems) on disk when
+    cancelled mid-render - it's all-or-nothing, same as a real failure.
+    """
+    path_map, names = speakers
+    out_path = str(tmp_path / "cancelled.wav")
+
+    written, peak = audio_export.export_audio(
+        out_path, names, KEEPS, mutes=MUTES, gains=GAINS, stems=True,
+        should_cancel=lambda: True)
+
+    assert written == []
+    assert peak == 0.0
+    assert not os.path.exists(out_path)
+    assert not any(f.endswith(".wav") for f in os.listdir(tmp_path))
+
+
+def test_bake_processed_media_stops_between_speakers(speakers, tmp_path,
+                                                     monkeypatch):
+    """
+    bake_processed_media (the FCPXML "bake effects" export) must stop
+    picking up new speakers once cancelled, rather than baking every
+    speaker regardless - the bug this whole fix addresses. The mux step
+    (real ffmpeg) is faked out here so a stopped-early result is
+    unambiguously due to should_cancel, not an unrelated ffmpeg failure on
+    these synthetic .pcm "media" files.
+    """
+    import audio_export as ae
+
+    class _FakeCompletedProcess:
+        returncode = 0
+        stderr = b""
+
+    path_map, names = speakers
+    baked_so_far = []
+    orig_render_track = ae.render_track
+
+    def counting_render_track(*args, **kwargs):
+        baked_so_far.append(args[0])
+        return orig_render_track(*args, **kwargs)
+
+    should_cancel = lambda: len(baked_so_far) >= 1
+
+    out_dir = str(tmp_path / "baked")
+    monkeypatch.setattr(ae, "_probe_duration", lambda path: 1.0)
+    monkeypatch.setattr(ae, "render_track", counting_render_track)
+    monkeypatch.setattr(ae.subprocess, "run",
+                        lambda *a, **k: _FakeCompletedProcess())
+
+    written = ae.bake_processed_media(names, out_dir, mutes=MUTES,
+                                      gains=GAINS, should_cancel=should_cancel)
+
+    assert baked_so_far == [names[0]]
+    assert len(written) == 1
+
+    assert len(baked_so_far) == 1
+
+
 def test_export_is_byte_identical_with_bookends(speakers, tmp_path, monkeypatch):
     """The intro/outro beds are written as separate parts, not concatenated."""
     path_map, names = speakers
@@ -257,3 +352,137 @@ def test_mix_memory_does_not_scale_with_speaker_count(tmp_path, monkeypatch):
 
     # Before, eight speakers held eight rendered tracks plus the mix.
     assert eight < four * 1.1, f"peak scaled with speakers: {four} -> {eight}"
+
+
+def test_stems_export_leaves_no_files_on_mid_render_failure(speakers, tmp_path):
+    """
+    export_audio's stems path writes each stem to a temp file as tracks
+    finish, renaming to final names only after render_tracks returns
+    successfully - specifically so a failure partway through still leaves
+    zero stem files, matching the pre-existing all-or-nothing behavior of
+    the old accumulate-then-write-at-the-end approach. A naive "write
+    immediately" version would leave the earlier tracks' stems on disk.
+    """
+    path_map, names = speakers
+
+    real_render_track = audio_export.render_track
+
+    def flaky_render_track(path, *args, **kwargs):
+        if path == names[2]:
+            raise RuntimeError("synthetic failure on the last track")
+        return real_render_track(path, *args, **kwargs)
+
+    import pytest as _pytest
+    with _pytest.MonkeyPatch.context() as mp:
+        mp.setattr(audio_export, "render_track", flaky_render_track)
+        with _pytest.raises(RuntimeError, match="synthetic failure"):
+            audio_export.export_audio(
+                str(tmp_path / "new.wav"), names, KEEPS, mutes=MUTES,
+                chains=None, gains=GAINS, stems=True)
+
+    leftovers = [p for p in os.listdir(tmp_path)
+                if p.startswith("new") or p.endswith(".tmp")]
+    assert leftovers == [], f"stems/temp files left behind: {leftovers}"
+
+
+def test_want_audio_with_on_track_stays_bounded_by_workers(tmp_path):
+    """
+    render_tracks' on_track callback (used by export_audio's stems path) must
+    actually keep peak memory bounded by `workers` tracks' worth, not
+    `total_tracks` - the gap the old `rendered` list had for want_audio=True.
+
+    Uses a FAKE chain whose process() allocates a real, realistically-sized
+    numpy array, not a real pedalboard/VST3 TrackChain: tracemalloc only
+    tracks Python/numpy allocations, so a test built on a real VST chain
+    would pass identically whether or not this fix works (its memory is
+    mostly invisible C++ allocations) - a false green.
+    """
+    import tracemalloc
+
+    track_seconds = 20.0
+    track_samples = int(48000 * track_seconds)
+    total_tracks = 8
+    workers = 2
+
+    class FakeSnapshot:
+        def process(self, audio, sample_rate, reset=True, log=None,
+                   should_cancel=None):
+            # A same-length float32 buffer, like a real plugin pass.
+            return np.array(audio, dtype=np.float32, copy=True)
+
+        def describe(self):
+            return "fake chain"
+
+    class FakeChain:
+        def active_slots(self):
+            return [object()]
+
+        def snapshot(self, log=None):
+            return FakeSnapshot()
+
+    rng = np.random.default_rng(23)
+    path_map = {}
+    names = []
+    for index in range(total_tracks):
+        name = f"w{index}"
+        samples = rng.integers(-25000, 25000, track_samples, dtype=np.int16)
+        path = tmp_path / f"{name}.pcm"
+        path.write_bytes(samples.tobytes())
+        path_map[name] = str(path)
+        names.append(name)
+
+    seen = []
+
+    def on_track(path, audio):
+        # Simulates export_audio writing the stem out and dropping it -
+        # nothing here should keep `audio` alive past this call.
+        seen.append(path)
+
+    import audio_export as ae
+    orig_decode_to_pcm = ae.decode_to_pcm
+    ae.decode_to_pcm = lambda n: path_map[n]
+    try:
+        tracemalloc.start()
+        ae.render_tracks(
+            names, [(0.0, track_seconds)],
+            chains=[FakeChain() for _ in names],
+            max_workers=workers, want_audio=True, on_track=on_track)
+        _current, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+    finally:
+        ae.decode_to_pcm = orig_decode_to_pcm
+
+    assert len(seen) == total_tracks
+
+    # One track's raw+processed audio is roughly 2 * 4 bytes/sample here.
+    one_track_bytes = track_samples * 4 * 2
+    # Generous bound: `workers` tracks' worth plus the shared mix buffer,
+    # with headroom - not `total_tracks` worth, which is what the old
+    # `rendered` list would have cost.
+    bound = one_track_bytes * (workers + 2) * 2
+    assert peak < bound, (
+        f"peak {peak} bytes not bounded by ~{workers} tracks worth "
+        f"(bound {bound}) across {total_tracks} tracks - want_audio with "
+        f"on_track is still holding more than {workers} tracks' audio")
+
+
+def test_render_tracks_reports_finished_per_track(speakers):
+    """
+    render_tracks now sends an explicit "finished <name>" progress message
+    once each track's render_track() call returns (2026-09-14) - callers
+    that turn progress messages into a real fraction (app.py's
+    _track_render_progress) need this unambiguous completion signal, since
+    a track being merely MENTIONED in a decode/processing message doesn't
+    mean it's done, especially once tracks render concurrently.
+    """
+    path_map, names = speakers
+    messages = []
+
+    audio_export.render_tracks(names, KEEPS, mutes=MUTES, gains=GAINS,
+                               progress=messages.append)
+
+    for name in names:
+        finished = [m for m in messages if m == f"finished {name}"]
+        assert len(finished) == 1, (
+            f"expected exactly one 'finished {name}' message, "
+            f"got {finished} in {messages}")
