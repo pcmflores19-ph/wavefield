@@ -13,7 +13,7 @@ a **finished audio file** ready to upload.
 Everything happens on your own computer. No account, no subscription, nothing
 uploaded anywhere.
 
-![Wavefield: a two-track waveform with speaker cuts, transcript and effects panel](docs/img/screenshot.png)
+![Wavefield: a two-track waveform with speaker cuts, transcript and effects panel](docs/img/screenshot_1.2.1.png)
 
 ---
 
