@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Launcher for macOS and Linux. The Windows equivalent is launch_autocut.bat.
+# Launcher for macOS and Linux. The Windows equivalent is launch_wavefield.bat.
 set -e
 cd "$(dirname "$0")/auto_cut"
 

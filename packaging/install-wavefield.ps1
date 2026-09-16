@@ -179,7 +179,7 @@ if ($LASTEXITCODE -ne 0) { throw "pip install failed" }
 
 # ------------------------------------------------------------------ launcher
 Step "Creating a launcher"
-$launcher = Join-Path $InstallDir "run-wavefield.bat"
+$launcher = Join-Path $InstallDir "launch_wavefield.bat"
 $venvPyw = Join-Path $venvDir "Scripts\pythonw.exe"
 @"
 @echo off

@@ -16,7 +16,7 @@ pip install -r requirements.txt
 python auto_cut/app.py
 ```
 
-Or `launch_autocut.bat` on Windows, `./launch_autocut.sh` elsewhere.
+Or `launch_wavefield.bat` on Windows, `./launch_wavefield.sh` elsewhere.
 
 ## Building the installer
 

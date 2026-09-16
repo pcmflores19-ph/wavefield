@@ -58,7 +58,8 @@ complicated: you paste in one line of text, and it does the rest for you.
 
 You don't need to be an administrator on the computer to do this, and it's safe to
 run again later — it'll just double-check everything is up to date instead of
-starting over.
+starting over. That Start Menu shortcut runs a file called `launch_wavefield.bat`,
+if you ever want to find and open it directly instead.
 
 ### Check your download
 

@@ -15,7 +15,7 @@ REM Only pause if something went wrong, so a normal close doesn't leave a
 REM console window sitting there.
 if errorlevel 1 (
     echo.
-    echo Auto-Cut exited with an error ^(code %errorlevel%^).
+    echo Wavefield exited with an error ^(code %errorlevel%^).
     pause
 )
 endlocal
