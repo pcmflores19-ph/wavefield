@@ -70,7 +70,7 @@ file published here and nobody has altered it on the way to you.
 Open PowerShell in your Downloads folder and run:
 
 ```powershell
-Get-FileHash .\Wavefield-Setup-1.2.0.exe
+Get-FileHash .\Wavefield-Setup-1.2.1.exe
 ```
 
 Compare what it prints against the SHA-256 in the
