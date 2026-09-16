@@ -35,6 +35,31 @@ do it later from **File > Settings**.
 >
 > To continue: click **More info**, then **Run anyway**.
 
+### Can't run the installer? Install it a different way
+
+If Windows won't let the installer run at all — it gets deleted, blocked, or your
+work computer refuses to run any unsigned program — you can install Wavefield
+without it, using a built-in Windows tool called PowerShell instead. It's not
+complicated: you paste in one line of text, and it does the rest for you.
+
+1. Click the **Start** button and type `PowerShell`. Click **Windows PowerShell**
+   when it appears (a black or blue window will open).
+2. Copy this line, paste it into that window (right-click to paste), and press
+   **Enter**:
+
+   ```powershell
+   irm https://raw.githubusercontent.com/pcmflores19-ph/wavefield/main/packaging/install-wavefield.ps1 | iex
+   ```
+
+3. Follow along — it prints what it's doing as it goes. It downloads Wavefield,
+   sets it up in its own little corner of your computer so it can't interfere with
+   anything else, and adds a **Wavefield** shortcut to your Start Menu, just like a
+   normal install.
+
+You don't need to be an administrator on the computer to do this, and it's safe to
+run again later — it'll just double-check everything is up to date instead of
+starting over.
+
 ### Check your download
 
 Every release lists a **SHA-256** — a long code that acts as a fingerprint for
@@ -66,8 +91,7 @@ a trojan.
 **This is a false positive, and it is being formally disputed with Microsoft.**
 It happens because Wavefield is built with a tool called PyInstaller, which
 packs a program and its Python runtime into one executable. Some malware does
-the same, so unsigned PyInstaller files get flagged on pattern alone. Code
-signing is what ends this for good, and the application for it is pending.
+the same, so unsigned PyInstaller files get flagged on pattern alone.
 
 If you would rather not wait, here is how to get the file back — but please do
 the middle step, because the whole point is to be sure it is genuinely ours:
@@ -85,25 +109,6 @@ If you would rather trust nothing you cannot inspect, that is entirely
 reasonable — the full source is in this repository and
 [docs/DEVELOPERS.md](docs/DEVELOPERS.md) explains how to build the installer
 yourself.
-
-</details>
-
-<details>
-<summary><b>Install from the terminal instead</b> — no .exe, for when the installer keeps getting blocked</summary>
-
-If the installer keeps getting flagged or blocked and you'd rather skip it
-entirely, this does the same install from the terminal: it downloads
-Wavefield's source from GitHub and its dependencies from PyPI, sets up
-speech recognition the same way the installer does, and adds a Start Menu
-shortcut — nothing here is a prebuilt executable you have to trust blindly.
-
-Open PowerShell and run:
-
-```powershell
-irm https://raw.githubusercontent.com/pcmflores19-ph/wavefield/main/packaging/install-wavefield.ps1 | iex
-```
-
-No administrator rights needed. Safe to run again later to update.
 
 </details>
 
@@ -360,36 +365,7 @@ version, you have to make your source available under the same licence.
 
 ---
 
-## Code signing policy
-
-Release builds are signed so Windows can verify they came from this project and
-have not been altered since.
-
-> **Status:** signing is not in place yet — an application to the SignPath
-> Foundation is pending, so **no release so far is signed**. That is why
-> Windows may warn about a download or, on some machines, refuse to run it.
-> Until it is granted, verify a download with its checksum instead: see
-> [Download](#download). This notice will change here once signing is live.
-
-- Wavefield is built and signed **only** by the automated release workflow in
-  [`.github/workflows/`](.github/workflows), from the source in this
-  repository. Nothing is signed from a developer's machine.
-- Signing uses a free certificate granted to open-source projects by the
-  [SignPath Foundation](https://signpath.org/), with the certificate held by
-  SignPath — this project never possesses the private key.
-- Every signing request requires manual approval by the project maintainer
-  (Paul Flores).
-- The only official download is the
-  [Releases page](../../releases/latest) of this repository. A copy of
-  Wavefield obtained anywhere else is not something this project can vouch for.
-
-To check a download yourself: **while signing is pending**, compare its
-checksum against the one in the release notes — see
-[Check your download](#check-your-download). Once signing is live you will also
-be able to right-click the file, choose **Properties**, and look at the
-**Digital Signatures** tab; that tab is empty until then.
-
-### Privacy
+## Privacy
 
 Wavefield does its work entirely on your computer. It does not upload your
 recordings, your transcripts or your projects anywhere. The only network
