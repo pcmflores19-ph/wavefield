@@ -844,6 +844,7 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
         # neither happens when a project is reopened with switching already
         # saved as on - and then the CAMERAS strip had nothing to draw.
         self.recompute_scenes()
+        self._grow_timeline_pane()
 
     def _analysis_failed(self, exc):
         self._stop_busy()
@@ -1744,6 +1745,39 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
         # shrunk scrolls back up rather than leaving a band of empty timeline.
         if self.canvas.yview()[1] >= 1.0:
             self._on_lane_scroll("moveto", 0.0)
+
+    def _grow_timeline_pane(self):
+        """
+        Grows the timeline pane, on the vertical sash between it and the
+        inspector/transcript/log area above, tall enough to show up to three
+        tracks (plus the CAMERAS strip, if on) without scrolling.
+
+        Capped at three tracks rather than "however many exist" so a project
+        with five or six speaker tracks doesn't crush the transcript and log
+        down to nothing. Only ever grows the pane, never shrinks it - once the
+        user has dragged the sash, further track/analysis changes leave it
+        where they put it.
+        """
+        pane = getattr(self, "edit_pane", None)
+        if pane is None or not self.peaks_list:
+            return
+        self.root.update_idletasks()
+        tracks = min(len(self.peaks_list), 3)
+        wanted = RULER_HEIGHT + tracks * LANE_HEIGHT
+        if self.scene_switching.get():
+            wanted += SCENE_STRIP_HEIGHT
+        # Transport/scrollbar/zoom row live below the canvas, outside the
+        # pane, but still have to fit inside the space we carve out for it.
+        wanted += self.timeline_footer.winfo_reqheight() + 40
+        total = pane.winfo_height()
+        if total <= 1:
+            return
+        try:
+            current_sash = pane.sashpos(0)
+        except tk.TclError:
+            return
+        if wanted > total - current_sash:
+            pane.sashpos(0, max(0, total - wanted))
 
     def _canvas_y(self, event):
         """Widget y -> lane-stack y. They differ once the lanes are scrolled,

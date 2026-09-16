@@ -13,9 +13,8 @@ YOUTUBE = "https://www.youtube.com/@marineearthscience"
 SPOTIFY = "https://open.spotify.com/show/4NTLrSfceKjpFvZWflzBJj"
 FACEBOOK = "https://www.facebook.com/btspodcastph"
 
-# Filled in once the form exists. Until then is_placeholder() keeps
-# "Report a problem" from opening a dead link.
-REPORT_FORM = "https://example.com/report-form"
+# Google Drive form used to collect problem reports.
+REPORT_FORM = "https://forms.gle/G1YgvvmcjYtQwEhQ8"
 
 PODCAST_NAME = "Behind The Science Podcast"
 

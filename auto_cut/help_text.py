@@ -22,8 +22,11 @@ DaVinci Resolve timeline or a finished WAV.
 The order decides which track each speaker lands on: the first file becomes
 V1/A1, the second V2/A2, and so on. Use Up to reorder.
 
-All the recordings must start at the same moment. That is what OBS produces.
-There is no sync correction, so a file that starts late will stay late.
+All the recordings should start at the same moment - that is what OBS
+produces. If they do not, press Sync: it detects, per recording, how far off
+it is from a reference you pick (by matching either when each person talks,
+or the room tone itself if they were recorded together), and trims or pads a
+synced copy for you to review before anything is changed for real.
 
 
 2. WAIT A MOMENT
@@ -117,8 +120,20 @@ the work in Resolve.
       Cuts, mutes, effects and levels all rendered in. For an audio podcast
       this is the whole job - no round trip through Resolve.
 
+  Finished video (MP4)
+      A single rendered video file - the picture from the Vodcast tab's camera
+      switching if it is set up, otherwise the first speaker's recording.
+      Cuts, mutes, effects and levels are all rendered in, the same as the WAV.
+
 Intro and outro audio, if you set them, are added to the WAV only, and are
 never cut or processed.
+
+
+7. VODCAST (OPTIONAL) - AUTOMATIC CAMERA SWITCHING
+
+Only for a two-person episode filmed on two cameras, with a third recording
+that already has both people in frame - see Vodcast > Read me for exactly
+what is required and how it works.
 
 
 SAVING
@@ -162,8 +177,11 @@ The FX window is empty
     only in the standard folder for your system. VST2 is not supported.
 
 Transcription never happens
-    It needs WhisperX, which is a separate install. Everything else works
-    without it - the cuts do not depend on the transcript at all.
+    It needs WhisperX. The installer sets this up for you automatically -
+    it is ticked by default on the last page of setup - so this should only
+    happen if that box was unchecked. Fix it from File > Settings > Install
+    WhisperX, no reinstall needed. Everything else works without it - the
+    cuts do not depend on the transcript at all.
 
 Transcription is very slow
     Without an NVIDIA graphics card it runs on the processor, which is slow for
@@ -177,6 +195,56 @@ The app closed by itself
     An audio plugin misbehaving can take the whole app down, and Python cannot
     catch that. It is recorded in autocut_crash.log next to the program.
     Sending that file with a bug report helps enormously.
+"""
+
+VODCAST_README = """\
+WHAT THIS IS FOR
+
+Automatic camera switching for a two-person video podcast filmed on separate
+cameras - cutting between a wide shot of both people and single shots of
+whoever is talking, without doing it by hand.
+
+
+WHAT YOU NEED
+
+  - Exactly two speaker recordings (host and guest), each WITH picture.
+    Audio-only recordings have nothing to cut between.
+
+  - A third recording (V3) that already has both people in frame - the wide
+    or "two-shot". Set it with Vodcast > Set merged video (V3).
+
+  - All three recordings must start at the same moment and run the same
+    length. There is no sync correction: a file that starts late stays late,
+    and a mismatch of more than half a second is rejected outright.
+
+If any of this is missing, Vodcast > Switch cameras automatically stays
+greyed out, and tells you what is missing when you try it anyway.
+
+
+HOW IT WORKS
+
+Turn on "Switch cameras automatically" and Wavefield decides, from who is
+talking, when to show the host, the guest, or the two-shot (V3) - a cut away
+to V3 happens automatically if one person is held on camera too long.
+
+Shot length... sets the two limits that shape the result: the shortest a shot
+may run (a brief reply should not cut away and back within a moment) and the
+longest (nobody should be held on camera so long it looks stuck).
+
+Camera changes are hand-edited the same way ordinary cuts are: drag along a
+row in the CAMERAS strip to set which camera plays for a stretch. Hand edits
+are sticky - they survive re-analysis and slider changes - so Vodcast >
+Regenerate camera switching exists to throw them away and switch again from
+the audio alone, if you would rather start over.
+
+
+EXPORT
+
+Camera switching carries into both picture exports: Export > Finished video
+(MP4) renders it directly, and Export > Timeline for DaVinci Resolve writes
+the camera changes as video-track edits on the V1/V2/V3 lanes, ready to
+review or refine in Resolve. It has no effect on the WAV export, which is
+audio only.
 """
 
 ABOUT = f"""\

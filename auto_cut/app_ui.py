@@ -203,58 +203,8 @@ class UIBuilderMixin:
             "Keyboard shortcuts", help_text.SHORTCUTS))
 
     def report_problem(self):
-        """
-        Writes a diagnostic file and shows the user where it went.
-
-        Asked for confirmation first, and told exactly what is being collected:
-        "diagnostics" is a word that has carried a lot of spyware over the
-        years, and someone who is already annoyed enough to report a bug should
-        not have to take it on trust.
-        """
-        import diagnostics
-        import report_dialog
-
-        has_form = not links.is_placeholder(links.REPORT_FORM)
-        send_step = (
-            "A form will then open in your browser where you can attach the "
-            "file and send it to us."
-            if has_form else
-            "It is up to you whether to send it to us.")
-
-        if not messagebox.askokcancel(
-                "Report a problem",
-                "This writes a file describing what went wrong, so it can be "
-                "fixed." + chr(10) * 2 +
-                "It records: the app version, your version of Windows, your "
-                "graphics card, whether speech recognition is set up, the "
-                "names and lengths of the recordings you have open, and the "
-                "log from this session." + chr(10) * 2 +
-                "It does NOT include your recordings, your transcript, or the "
-                "folders your files live in." + chr(10) * 2 +
-                "The file is saved on this computer first. " + send_step):
-            return
-
-        description = report_dialog.ask(self.root)
-
-        try:
-            path = diagnostics.write_report(self, description=description)
-        except Exception as exc:
-            messagebox.showerror(
-                "Could not write the report",
-                f"The report could not be saved:{chr(10) * 2}{exc}")
-            return
-
-        self.log(f"Wrote problem report: {os.path.basename(path)}")
-        revealed = diagnostics.reveal(path)
-
-        if has_form:
-            messagebox.showinfo(
-                "Report saved",
-                "Saved to:" + chr(10) + path + chr(10) * 2 +
-                "A form will now open - please attach this file there.")
-            self._open_url(links.REPORT_FORM)
-        elif not revealed:
-            messagebox.showinfo("Report saved", f"Saved to:{chr(10)}{path}")
+        """Help > Report a problem - straight to the form, nothing saved locally."""
+        self._open_url(links.REPORT_FORM)
 
     def _show_help(self, title, body):
         """A read-only, scrollable, resizable text window."""
@@ -349,6 +299,7 @@ class UIBuilderMixin:
 
         pane = ttk.PanedWindow(parent, orient="vertical")
         pane.pack(fill="both", expand=True)
+        self.edit_pane = pane
 
         upper = ttk.Frame(pane)
         pane.add(upper, weight=3)
@@ -750,6 +701,10 @@ class UIBuilderMixin:
         self.max_shot_seconds = tk.DoubleVar(value=25.0)
 
         menu = tk.Menu(menubar, **ui_theme.menu_options())
+        menu.add_command(label="Read me...",
+                         command=lambda: self._show_help(
+                             "Vodcast", help_text.VODCAST_README))
+        menu.add_separator()
         menu.add_command(label="Set merged video (V3)...",
                          command=self.choose_v3)
         self._v3_entry = menu.index("end")
