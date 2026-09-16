@@ -89,6 +89,25 @@ yourself.
 </details>
 
 <details>
+<summary><b>Install from the terminal instead</b> — no .exe, for when the installer keeps getting blocked</summary>
+
+If the installer keeps getting flagged or blocked and you'd rather skip it
+entirely, this does the same install from the terminal: it downloads
+Wavefield's source from GitHub and its dependencies from PyPI, sets up
+speech recognition the same way the installer does, and adds a Start Menu
+shortcut — nothing here is a prebuilt executable you have to trust blindly.
+
+Open PowerShell and run:
+
+```powershell
+irm https://raw.githubusercontent.com/pcmflores19-ph/wavefield/main/packaging/install-wavefield.ps1 | iex
+```
+
+No administrator rights needed. Safe to run again later to update.
+
+</details>
+
+<details>
 <summary><b>"An Application Control policy has blocked this file"</b> — a different, harder block</summary>
 
 If you get this instead, with **CreateProcess failed; code 4551**, there is no
