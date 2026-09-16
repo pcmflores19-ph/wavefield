@@ -2,9 +2,9 @@
 Saving and reopening a session.
 
 Everything the app holds that isn't re-derivable from the media goes in a JSON
-`.autocut` file: the recordings, every hand edit, mixer state, VST chains (with
-each plugin's own `raw_state`, so a chain reopens exactly as it was tuned),
-framing, scene overrides and the transcript.
+`.wavefield_project` file: the recordings, every hand edit, mixer state, VST
+chains (with each plugin's own `raw_state`, so a chain reopens exactly as it
+was tuned), framing, scene overrides and the transcript.
 
 Deliberately NOT stored: waveform peaks, decoded PCM and WhisperX output. Those
 live in `.cache/`, are keyed by file content, and rebuild on demand - putting
@@ -19,7 +19,12 @@ import settings
 import time
 
 FORMAT_VERSION = 2
-PROJECT_EXTENSION = ".autocut"
+PROJECT_EXTENSION = ".wavefield_project"
+# The extension used before the app was renamed from Auto-Cut to Wavefield.
+# load() doesn't care about extension at all - it only looks at content - so
+# old projects already open with no special handling. This constant exists so
+# the Open dialog can still list them by default; it is not otherwise read.
+LEGACY_PROJECT_EXTENSION = ".autocut"
 
 
 # Chain (de)serialisation lives in chain_io now - presets need exactly the same
@@ -89,7 +94,7 @@ def load(path):
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
     if not isinstance(data, dict) or "speaker_paths" not in data:
-        raise ValueError("That doesn't look like an auto_cut project file.")
+        raise ValueError("That doesn't look like a Wavefield project file.")
     return data
 
 

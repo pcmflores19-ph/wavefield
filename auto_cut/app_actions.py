@@ -86,7 +86,7 @@ class ActionsMixin:
     def save_project_as(self):
         path = filedialog.asksaveasfilename(
             title="Save project", defaultextension=project_io.PROJECT_EXTENSION,
-            filetypes=[("auto_cut project", "*" + project_io.PROJECT_EXTENSION),
+            filetypes=[("Wavefield project", "*" + project_io.PROJECT_EXTENSION),
                        ("All files", "*.*")])
         if not path:
             return
@@ -101,7 +101,9 @@ class ActionsMixin:
     def open_project(self):
         path = filedialog.askopenfilename(
             title="Open project",
-            filetypes=[("auto_cut project", "*" + project_io.PROJECT_EXTENSION),
+            filetypes=[("Wavefield project",
+                        ("*" + project_io.PROJECT_EXTENSION,
+                         "*" + project_io.LEGACY_PROJECT_EXTENSION)),
                        ("All files", "*.*")])
         if not path:
             return
