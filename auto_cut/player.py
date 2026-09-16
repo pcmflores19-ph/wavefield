@@ -56,7 +56,9 @@ def decode_to_pcm(audio_path):
         "-map", "0:a:0", "-ac", "1", "-ar", str(SAMPLE_RATE),
         "-f", "s16le", tmp_path,
     ]
-    result = subprocess.run(cmd, capture_output=True)
+    result = subprocess.run(cmd, capture_output=True,
+                            creationflags=getattr(subprocess,
+                                                  "CREATE_NO_WINDOW", 0))
     if result.returncode != 0:
         raise RuntimeError(
             f"ffmpeg PCM decode failed for {os.path.basename(audio_path)}:\n"

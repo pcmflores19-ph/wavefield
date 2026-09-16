@@ -364,6 +364,22 @@ program and lists every bundled component with its own licence.
 You are free to use, study, share and modify it. If you distribute a modified
 version, you have to make your source available under the same licence.
 
+### Built with
+
+Wavefield stands on several open-source projects:
+
+- [FFmpeg](https://ffmpeg.org/) for reading and writing media
+- [Silero VAD](https://github.com/snakers4/silero-vad) for detecting speech
+- [rnnoise](https://github.com/werman/noise-suppression-for-voice) for
+  denoising
+- [pedalboard](https://github.com/spotify/pedalboard) for hosting VST3
+  effects
+- [WhisperX](https://github.com/m-bain/whisperX) for transcripts, when you
+  install it
+
+Full licence terms for every bundled component are in
+`THIRD-PARTY-NOTICES.txt`.
+
 ---
 
 ## Privacy

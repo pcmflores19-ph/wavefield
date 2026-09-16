@@ -348,6 +348,14 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
         for index in reversed(selection):
             self.files_list.delete(index)
             del self.speaker_paths[index]
+        if self.scene_switching.get() and len(self.speaker_paths) != 2:
+            # Camera switching needs exactly two speaker tracks (see
+            # vodcast_problem); removing a track can leave it stale and
+            # pointing at a track index that no longer exists.
+            self.scene_switching.set(False)
+            self.scenes = []
+            self.log("Camera switching off (needs exactly two speaker recordings).")
+            self._refresh_vodcast_menu()
         self._invalidate_analysis()
         self._build_mixer()
         if self.speaker_paths:
@@ -1086,6 +1094,8 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
         """
         import scenes as scenes_mod
         if not self.scene_switching.get() or not self.scenes:
+            return None, None
+        if len(self.speaker_paths) != 2:
             return None, None
         sources = [self.speaker_paths[0], self.speaker_paths[1], self.v3_path]
         return scenes_mod.apply_to_keep_ranges(self.scenes, keep_ranges), sources
@@ -2816,9 +2826,9 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
             #    intro and outro so the sound never runs past the picture.
             self._export_step("Encoding video...", 0.0)
             segments, sources = self.export_segments(keep_ranges)
-            self.log(f"[TIMING] {len(segments)} segments across "
-                     f"{len(sources)} camera source(s)")
             if segments:
+                self.log(f"[TIMING] {len(segments)} segments across "
+                         f"{len(sources)} camera source(s)")
                 self._export_step(
                     f"Switching between {len(sources)} cameras "
                     f"({len(segments)} shots)...", 0.0)
@@ -2973,7 +2983,7 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
             # point at the same asset the spine/speaker lanes reference.
             scenes_for_export = None
             camera_media = None
-            if self.scene_switching.get() and self.scenes:
+            if self.scene_switching.get() and self.scenes and len(media) >= 2:
                 import scenes as scenes_mod
                 scenes_for_export = scenes_mod.apply_to_keep_ranges(
                     self.scenes, keep_ranges)

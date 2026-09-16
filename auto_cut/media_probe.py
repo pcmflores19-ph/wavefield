@@ -71,7 +71,9 @@ def probe(path):
         "-show_streams", "-show_format",
         path,
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True,
+                            creationflags=getattr(subprocess,
+                                                  "CREATE_NO_WINDOW", 0))
     if result.returncode != 0:
         raise RuntimeError(f"ffprobe failed on {path}:\n{result.stderr}")
 

@@ -45,7 +45,9 @@ def decode_audio_file(path):
         "-map", "0:a:0", "-ac", "1", "-ar", str(SAMPLE_RATE),
         "-f", "f32le", "-",
     ]
-    result = subprocess.run(cmd, capture_output=True)
+    result = subprocess.run(cmd, capture_output=True,
+                            creationflags=getattr(subprocess,
+                                                  "CREATE_NO_WINDOW", 0))
     if result.returncode != 0:
         raise RuntimeError(
             f"Could not decode {os.path.basename(path)}:\n"
@@ -630,7 +632,9 @@ def bake_processed_media(speaker_paths, out_dir, mutes=None, chains=None,
             "-shortest",
             out_path,
         ]
-        result = subprocess.run(cmd, capture_output=True)
+        result = subprocess.run(cmd, capture_output=True,
+                                creationflags=getattr(subprocess,
+                                                      "CREATE_NO_WINDOW", 0))
         if result.returncode != 0:
             raise RuntimeError(
                 f"ffmpeg failed muxing {os.path.basename(path)}:\n"
@@ -650,6 +654,7 @@ def _probe_duration(path):
         [FFPROBE, "-v", "error", "-show_entries", "format=duration",
          "-of", "default=nw=1:nk=1", path],
         capture_output=True, text=True,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
     if result.returncode != 0:
         raise RuntimeError(f"ffprobe failed on {path}: {result.stderr}")

@@ -78,6 +78,7 @@ def _probe(exe_path):
         result = subprocess.run(
             [python, "-c", "import torch; print(torch.cuda.is_available())"],
             capture_output=True, text=True, timeout=60,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except Exception:
         return None
@@ -361,6 +362,7 @@ def transcribe(audio_path, model=DEFAULT_MODEL, language=DEFAULT_LANGUAGE,
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, encoding="utf-8", errors="replace", env=env,
             bufsize=1,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         tail = []
         try:

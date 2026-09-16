@@ -132,7 +132,8 @@ def has_nvenc():
             [FFMPEG, "-hide_banner", "-f", "lavfi",
              "-i", "color=black:s=256x256:d=0.1",
              "-c:v", "h264_nvenc", "-f", "null", "-"],
-            capture_output=True, text=True, timeout=60)
+            capture_output=True, text=True, timeout=60,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         _nvenc_cache = result.returncode == 0
     except Exception:
         _nvenc_cache = False
@@ -273,7 +274,9 @@ def _run_encode(cmd, out_path, on_time, should_cancel):
         process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
                                    stderr=subprocess.PIPE, text=True,
                                    encoding="utf-8", errors="replace",
-                                   bufsize=1)
+                                   bufsize=1,
+                                   creationflags=getattr(subprocess,
+                                                         "CREATE_NO_WINDOW", 0))
     except Exception:
         _discard(out_path)
         raise
@@ -549,7 +552,8 @@ def render(video_path, audio_path, out_path, keep_ranges, crf=DEFAULT_CRF,
         result = subprocess.run(
             [FFMPEG, "-y", "-hide_banner", "-f", "concat", "-safe", "0",
              "-i", concat_list, "-c", "copy", video_only],
-            capture_output=True, text=True, encoding="utf-8", errors="replace")
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         if result.returncode != 0:
             raise RuntimeError(result.stderr)
 
@@ -564,7 +568,8 @@ def render(video_path, audio_path, out_path, keep_ranges, crf=DEFAULT_CRF,
              "-map", "0:v:0", "-map", "1:a:0",
              "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
              "-movflags", "+faststart", out_path],
-            capture_output=True, text=True, encoding="utf-8", errors="replace")
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         if result.returncode != 0:
             raise RuntimeError(result.stderr)
 

@@ -136,7 +136,9 @@ def render_synced_copy(path, offset_seconds, log=None):
     if log:
         log(f"  rendering synced copy of {os.path.basename(path)} "
             f"({offset_seconds:+.3f}s) ...")
-    result = subprocess.run(cmd, capture_output=True)
+    result = subprocess.run(cmd, capture_output=True,
+                            creationflags=getattr(subprocess,
+                                                  "CREATE_NO_WINDOW", 0))
     if result.returncode != 0:
         raise RuntimeError(
             f"Could not render a synced copy of {os.path.basename(path)}:\n"

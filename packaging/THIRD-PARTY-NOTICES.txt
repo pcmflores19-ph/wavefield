@@ -67,6 +67,16 @@ makes the distributed application as a whole subject to GPL v3. See the
 top of this file for where to obtain the source.
 
 --------------------------------------------------------------------------
+Silero VAD  (assets/silero_vad.onnx)
+--------------------------------------------------------------------------
+Licence : MIT
+Source  : https://github.com/snakers4/silero-vad
+Copyright (c) 2020-present Silero Team.
+
+Unmodified ONNX model file, used directly via onnxruntime (no Silero Python
+package). Used to detect speech for cut placement.
+
+--------------------------------------------------------------------------
 Optional, not bundled
 --------------------------------------------------------------------------
 WhisperX (BSD-4-Clause) is used for transcription when you install it
