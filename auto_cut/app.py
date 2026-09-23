@@ -42,7 +42,7 @@ from silence_detector import (aggressiveness_to_min_gap, apply_mute_edits,
                               compute_auto_mutes_from_intervals,
                               compute_keep_ranges_from_intervals, summarize)
 import voice_activity
-from waveform import processed_peaks
+from waveform import processed_peaks, samples_per_peak
 from whisperx_runner import language_label, model_label, transcribe
 
 LANE_HEIGHT = 74             # per-speaker waveform lane
@@ -181,6 +181,17 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
         self.root.after(2500, self._startup_update_check)
         self.root.after(3000, self._start_cache_prune)
         root.bind("<space>", self._on_space)
+        # Tk's bindtag order for a focused widget is widget-instance, then
+        # widget-CLASS, then toplevel, then "all" - so the plain root.bind
+        # above only ever runs AFTER a focused ttk.Button/Checkbutton/Scale's
+        # own class-level <space> binding has already fired (its default
+        # "activate the focused widget" behaviour), which is what let
+        # spacebar re-trigger whichever mute/solo/fx/fader control last had
+        # focus instead of toggling playback. Overriding the class binding
+        # directly - replacing it, not adding to it - makes space always mean
+        # play/pause regardless of what has focus.
+        for widget_class in ("TButton", "TCheckbutton", "TScale"):
+            root.bind_class(widget_class, "<space>", self._on_space)
         self._bind_shortcuts(root)
         root.bind_all("<MouseWheel>", self._on_wheel_anywhere)
         root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -237,9 +248,10 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
         return "break"
 
     def _on_space(self, event):
-        # Don't hijack the spacebar while a button/slider has focus.
-        if isinstance(event.widget, (ttk.Button, ttk.Scale, ttk.Checkbutton)):
-            return
+        # No focused-widget guard needed any more: the bind_class overrides
+        # in __init__ replace Button/Checkbutton/Scale's own default space
+        # activation for this handler, rather than running alongside it, so
+        # this never double-fires with a widget's own action.
         self.toggle_play()
         return "break"
 
@@ -559,7 +571,7 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
             with ThreadPoolExecutor(max_workers=workers) as pool:
                 futures = [
                     pool.submit(self._analyze_one_speaker, path, index,
-                               duration, denoiser, use_saved,
+                               denoiser, use_saved,
                                saved[index] if use_saved else None, cached_entry)
                     for index, path, fingerprint, cached_entry in jobs
                 ]
@@ -590,24 +602,43 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
             # Auto-mute is decided by comparing lanes, not per microphone.
             # On its own a lane cannot tell your voice from the other person
             # bleeding into your mic - which is why two people laughing used
-            # to break it.
-            self._pending_auto_mutes = self._compute_mutes(
-                speech_per_speaker, levels_per_speaker, hop, duration)
+            # to break it. Each lane's own decoded duration, never the
+            # shared cross-track one - see _compute_mutes's docstring.
+            pending_auto_mutes = self._compute_mutes(
+                speech_per_speaker, levels_per_speaker, hop, audio_durations)
 
-            self.speaker_media = media
-            self._audio_durations = audio_durations
-            self.per_speaker_speech = speech_per_speaker
-            self._speech_levels = levels_per_speaker
-            self._speech_hop = hop
-            self.timeline_duration = duration
-            self.peaks_list = peaks_list
-            self.auto_mutes = self._pending_auto_mutes
-            self.playhead = None
-            self.view_start = 0.0
-            self.view_span = duration
+            # The shared view-axis/playhead duration: the max of each
+            # track's own REAL decoded length, never ffprobe's
+            # container/format duration (`duration`, above) - ffprobe and
+            # decoded length can disagree (encoder priming/padding, VFR
+            # video), which is what let the view scroll into a region with
+            # no peak data, or clip off a track's real trailing audio.
+            # `duration` itself is untouched everywhere else (the cache-hit
+            # check above, and the cache entries written below) - only the
+            # view axis changes source.
+            view_duration = max(audio_durations) if audio_durations else duration
+
+            # Collected into one payload and applied on the main thread by
+            # _apply_analysis_results (via root.after) rather than written
+            # here directly - this thread writing 11 separate attributes one
+            # at a time let the main thread's _tick/_draw_waveform poll
+            # (which runs unconditionally every 60ms) read a mix of new and
+            # stale fields (e.g. new peaks_list paired with old
+            # _audio_durations) during the window between statements.
+            results = {
+                "speaker_media": media,
+                "audio_durations": audio_durations,
+                "per_speaker_speech": speech_per_speaker,
+                "speech_levels": levels_per_speaker,
+                "speech_hop": hop,
+                "timeline_duration": view_duration,
+                "peaks_list": peaks_list,
+                "auto_mutes": pending_auto_mutes,
+                "view_span": view_duration,
+            }
             self.log("Analysis complete. Transcribe on the Transcript page "
                      "when you are happy with the edit.")
-            self.root.after(0, self._analysis_done)
+            self.root.after(0, lambda r=results: self._apply_analysis_results(r))
         except Exception as exc:
             # The bare message ("list index out of range") doesn't say which
             # of several per-speaker calls raised it - log where, not just
@@ -617,7 +648,33 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
             self.log(traceback.format_exc())
             self.root.after(0, lambda e=exc: self._analysis_failed(e))
 
-    def _analyze_one_speaker(self, path, index, duration, denoiser, use_saved,
+    def _apply_analysis_results(self, results):
+        """
+        Commits one analysis pass's results as a single main-thread step.
+
+        Runs via root.after(0, ...) from _analyze_worker (a background
+        thread) - never called directly from that thread. All of these
+        fields must land together: _draw_waveform and _update_playhead_position
+        pair peaks_list[i] with _audio_durations[i], and a redraw landing
+        between two separate attribute writes (the old shape of this method)
+        could read one pass's peaks against a different pass's duration.
+        Assigning from one already-fully-built dict is atomic under the GIL,
+        so there is no such window here.
+        """
+        self.speaker_media = results["speaker_media"]
+        self._audio_durations = results["audio_durations"]
+        self.per_speaker_speech = results["per_speaker_speech"]
+        self._speech_levels = results["speech_levels"]
+        self._speech_hop = results["speech_hop"]
+        self.timeline_duration = results["timeline_duration"]
+        self.peaks_list = results["peaks_list"]
+        self.auto_mutes = results["auto_mutes"]
+        self.playhead = None
+        self.view_start = 0.0
+        self.view_span = results["view_span"]
+        self._analysis_done()
+
+    def _analyze_one_speaker(self, path, index, denoiser, use_saved,
                              saved_intervals, cached_entry):
         """
         One speaker's decode/denoise/VAD/peaks pipeline, run on a worker
@@ -657,8 +714,13 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
             levels = []
             this_hop = None
         else:
+            # This track's own decoded duration, never the shared
+            # cross-track one - the shared value used to clip a shorter
+            # track's speech intervals at the wrong point (or a longer
+            # track's not at all), which fed straight into
+            # _compute_mutes's same-shaped bug.
             intervals, levels, this_hop = voice_activity.speaking_intervals(
-                path, denoiser, duration=duration, log=self.log,
+                path, denoiser, duration=audio_duration, log=self.log,
                 with_levels=True)
         # This track's OWN real duration, not the shared timeline one - see
         # _peaks_for's docstring for why the two must never be conflated.
@@ -1521,16 +1583,17 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
                 self.canvas.create_line(0, top, width, top, fill="#333")
 
             n = len(peaks)
-            # This lane's OWN real decoded-audio duration (same value passed
-            # to _peaks_for), not the shared timeline one and not ffprobe's
-            # duration_seconds - peaks are bucketed to fit exactly that many
-            # seconds (see _peaks_for's docstring), so mapping them against
-            # any other duration here would read every later peak from the
-            # wrong bucket, same mismatch as if they'd been computed wrong.
-            own_duration = (self._audio_durations[lane_i]
-                            if lane_i < len(self._audio_durations)
-                            else self.timeline_duration)
-            per_second = n / own_duration if own_duration else 0.0
+            # No duration participates in this mapping at all - each peak
+            # bucket covers a FIXED number of samples (waveform.
+            # samples_per_peak), the same constant reduce_to_peaks used to
+            # write these buckets. A duration-based scale here (n /
+            # own_duration) used to disagree with reduce_to_peaks's own
+            # ceil-division bucket size whenever a track's sample count
+            # wasn't an exact multiple of the bucket count - drift that grew
+            # linearly with playback position. Using the identical constant
+            # on both sides makes the two agree by construction, for any
+            # track length.
+            per_second = PLAYER_SAMPLE_RATE / samples_per_peak(PLAYER_SAMPLE_RATE)
             half = LANE_HEIGHT / 2 - 3
             gain = self.waveform_gain
             for x in range(int(width)):
@@ -2013,7 +2076,7 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
         return out
 
     def _compute_mutes(self, speech_per_speaker, levels_per_speaker, hop,
-                       duration):
+                       durations):
         """
         Mute ranges per lane: everywhere that speaker is not the one talking.
 
@@ -2022,6 +2085,14 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
         simultaneous speech keeps every one of them open. Falls back to each
         speaker's own detected speech when levels are missing, which is the
         case for a project saved before this existed.
+
+        `durations` is each lane's own real decoded-audio duration (the same
+        per-track values _draw_waveform uses for peak scaling - see its
+        own_duration comment), never a single shared cross-track duration.
+        Clamping every lane's mutes to one shared value used to append a
+        trailing mute range past the end of a shorter lane's real audio (it
+        has no speech there to complement, but the shared bound said the
+        timeline kept going).
         """
         from silence_detector import active_intervals_by_lane_or_own
 
@@ -2034,8 +2105,14 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
                 self.log(f"  cross-lane mute detection failed ({exc}); "
                          "falling back to per-track detection")
                 basis = speech_per_speaker
-        return [compute_auto_mutes_from_intervals(intervals, 0.0, duration)
-                for intervals in basis]
+        durations = durations or []
+        fallback = durations[0] if durations else 0.0
+        return [
+            compute_auto_mutes_from_intervals(
+                intervals, 0.0,
+                durations[i] if i < len(durations) else fallback)
+            for i, intervals in enumerate(basis)
+        ]
 
     def _recompute_auto_mutes(self):
         if not self.per_speaker_speech:
@@ -2045,7 +2122,7 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
             self.per_speaker_speech,
             getattr(self, "_speech_levels", None),
             getattr(self, "_speech_hop", None),
-            self.timeline_duration)
+            getattr(self, "_audio_durations", None))
 
     def _on_auto_cut_toggle(self):
         state = "on" if self.auto_cut_on.get() else "off"

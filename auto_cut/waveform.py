@@ -40,23 +40,49 @@ def _bucket_maxima(block, buckets, per_bucket):
     return block.reshape(buckets, per_bucket).max(axis=1)
 
 
-def reduce_to_peaks(samples, total, duration_seconds, sample_rate,
+def samples_per_peak(sample_rate, peaks_per_second=PEAKS_PER_SECOND):
+    """
+    The fixed sample count each peak bucket covers - the one place this
+    number is computed, so reduce_to_peaks (writing) and the drawing code
+    that inverts a bucket index back to a sample offset (see app.py's
+    _draw_waveform) can never disagree about it.
+
+    Previously, bucket COUNT was derived from a duration in seconds
+    (round(duration_seconds * peaks_per_second)), and bucket SIZE was then
+    back-derived by ceiling-dividing the sample count by that bucket count.
+    The drawing code inverted the mapping the other way - a per-second
+    scale from the bucket count and a duration, with no ceiling. Those two
+    formulas only agree when total samples happens to be an exact multiple
+    of the bucket count; otherwise ceil(total/buckets) > total/buckets, and
+    every later peak reads earlier than where drawing looks for it, an
+    error that grows linearly with playback position. Confirmed by running
+    both formulas against a synthetic impulse at a known sample offset. The
+    fix is this function: samples-first, never duration-first. Bucket count
+    is derived FROM this fixed size (ceil(total/this)), never the reverse,
+    and nothing on either side ever computes a duration-based scale again.
+    """
+    return max(1, round(sample_rate / peaks_per_second))
+
+
+def reduce_to_peaks(samples, total, sample_rate,
                     peaks_per_second=PEAKS_PER_SECOND, offline=None, log=None):
     """
     The chunked peak-reduction loop shared by processed_peaks (in-process,
-    no plugins or a live chain via chain.snapshot()) and
-    vst_host._isolated_peaks_worker (a detached chain rebuilt in a fresh
-    child process - see that function for why plugins can't be loaded here
-    on the redraw thread). `samples` is int16 (a memmap straight off the
-    decode cache, or an equivalent array); `offline`, if given, is a
-    TrackChain-like object with the plugins already loaded, run once per
-    chunk exactly as processed_peaks always has.
+    no plugins or a live chain via chain.snapshot()). `samples` is int16 (a
+    memmap straight off the decode cache, or an equivalent array);
+    `offline`, if given, is a TrackChain-like object with the plugins
+    already loaded, run once per chunk exactly as processed_peaks always
+    has.
+
+    Takes no duration argument at all, deliberately - see
+    samples_per_peak's docstring for why a duration must never re-enter
+    this calculation.
     """
-    buckets = max(1, int(round(duration_seconds * peaks_per_second)))
+    per_bucket = samples_per_peak(sample_rate, peaks_per_second)
+    buckets = max(1, int(np.ceil(total / per_bucket))) if total else 1
     if total == 0:
         return np.zeros(buckets, dtype=np.float32)
 
-    per_bucket = int(np.ceil(total / buckets))
     # Whole buckets per pass, so every bucket's peak still sees all of its
     # samples and the result matches an all-at-once reduction exactly.
     step = max(1, int(round(CHUNK_SECONDS * sample_rate / per_bucket)))
@@ -90,7 +116,11 @@ def _peaks_cache_path(path, duration_seconds, peaks_per_second):
     stat = os.stat(path)
     key = hashlib.sha1(
         f"{path}|{stat.st_size}|{stat.st_mtime}|{duration_seconds}|"
-        f"{peaks_per_second}|peaks".encode("utf-8")
+        # v2: the bucket layout changed (samples_per_peak, sample-first -
+        # see its docstring) - this tag forces every pre-existing cached
+        # array, built under the old duration-first ceil-division bucketing,
+        # to miss instead of being served as a stale hit.
+        f"{peaks_per_second}|peaks|v2".encode("utf-8")
     ).hexdigest()
     directory = settings.cache_dir()
     os.makedirs(directory, exist_ok=True)
@@ -152,7 +182,7 @@ def processed_peaks(path, chain, duration_seconds, log=None,
     if chain is not None and chain.active_slots():
         offline = chain.snapshot(log=log)
 
-    peaks = reduce_to_peaks(samples, total, duration_seconds, SAMPLE_RATE,
+    peaks = reduce_to_peaks(samples, total, SAMPLE_RATE,
                             peaks_per_second=peaks_per_second, offline=offline,
                             log=log)
     if cache_path is not None:

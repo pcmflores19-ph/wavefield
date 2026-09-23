@@ -114,6 +114,10 @@ class Player:
 
         self._pos = 0               # playhead, in samples, in SOURCE time
         self._seg = 0               # index into keep_ranges, for sequential playback
+        # Output-stream latency (DAC time minus "now"), captured each block
+        # by _callback - see `position`'s docstring for why this only ever
+        # adjusts what's displayed, never _pos or seek().
+        self._output_latency = 0.0
         # Level of the summed output, for the master meter.
         self.master_peak = 0.0
         self.master_rms = 0.0
@@ -199,7 +203,17 @@ class Player:
 
     @property
     def position(self):
-        return self._pos / SAMPLE_RATE
+        """
+        The AUDIBLE position, not the sample most recently written to the
+        callback - those differ by the output stream's latency (buffering
+        between here and the DAC), tens to over a hundred ms depending on
+        host API. Compensation is applied only here, to what's displayed -
+        never to _pos itself or to seek()'s target, or a seek would land
+        latency ahead of where the user actually clicked, and repeated
+        skips would compound the correction.
+        """
+        latency_samples = self._output_latency * SAMPLE_RATE
+        return max(0.0, (self._pos - latency_samples) / SAMPLE_RATE)
 
     # ---------- mixing ----------
 
@@ -312,6 +326,18 @@ class Player:
             out[:buf.size] += buf
 
     def _callback(self, outdata, frames, time_info, status):
+        # DAC time minus "now", for this block - how far ahead of audible
+        # playback self._pos is about to get once this block is written.
+        # Unreliable/zero on some host APIs (sounddevice's own caveat), and
+        # None in a test double that doesn't build a real time_info - so
+        # clamped to a plausible range rather than trusted outright, and
+        # defaulted to 0 rather than raising when it's missing/malformed.
+        try:
+            latency = time_info.outputBufferDacTime - time_info.currentTime
+        except AttributeError:
+            latency = 0.0
+        self._output_latency = latency if 0.0 <= latency <= 1.0 else 0.0
+
         out = np.zeros(frames, dtype=np.float32)
         with self._lock:
             tracks = self._active_tracks()
