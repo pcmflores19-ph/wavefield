@@ -103,6 +103,7 @@ class ActionsMixin:
             title="Open project",
             filetypes=[("Wavefield project",
                         ("*" + project_io.PROJECT_EXTENSION,
+                         "*" + project_io.LEGACY_WAVEFIELD_EXTENSION,
                          "*" + project_io.LEGACY_PROJECT_EXTENSION)),
                        ("All files", "*.*")])
         if not path:

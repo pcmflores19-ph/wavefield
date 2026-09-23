@@ -139,7 +139,7 @@ what is required and how it works.
 SAVING
 
 File > Save project keeps your files, edits, levels and effect chains in one
-.wavefield_project file. The app also autosaves, and offers to recover after
+.wvprj file. The app also autosaves, and offers to recover after
 a crash.
 """
 
