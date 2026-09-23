@@ -273,6 +273,10 @@ times faster.
 **Making an audio podcast?** Choose *Finished audio (WAV)*. Everything is
 already applied — cuts, effects, levels. Upload it and you're done.
 
+**Just need the transcript?** Choose *Transcript only (.srt/.vtt/.txt)*. It
+writes the subtitle/text files straight from your edit, with no audio or
+video render at all.
+
 You can add intro and outro music from the same menu.
 
 ---
