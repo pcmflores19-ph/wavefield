@@ -161,6 +161,7 @@ def _center_editor_window(title, timeout=15.0):
                             SWP_NOSIZE | SWP_SHOWWINDOW)
         user32.SetWindowTextW(hwnd, title)
         user32.SetForegroundWindow(hwnd)
+        return (width, height)
 
     hwnd = None
     appear_deadline = time.time() + timeout
@@ -171,6 +172,14 @@ def _center_editor_window(title, timeout=15.0):
     # preset change left the editor unreachable again.
     rebuild_grace = 10.0
     gone_since = None
+    # The size place() last centered the window for. Compared against the
+    # window's actual size on every tick below - not to catch a user resize
+    # (these editors aren't user-resizable), but because a plugin can still
+    # change its OWN window after place() already ran once: some restore a
+    # saved editor size from their own state, and RNNoise specifically opens
+    # small and grows into its real size a moment later. When that happens
+    # the earlier centering is for the wrong size, so it needs to run again.
+    last_size = None
 
     while True:
         windows = juce_windows()
@@ -201,7 +210,7 @@ def _center_editor_window(title, timeout=15.0):
             # the menu instead of the editor.
             hwnd = max(windows, key=window_area)
             gone_since = None
-            place(hwnd)
+            last_size = place(hwnd)
             time.sleep(TOPMOST_REASSERT_SECONDS)
             continue
 
@@ -220,6 +229,26 @@ def _center_editor_window(title, timeout=15.0):
             # user is actually typing into.
             user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
                                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+
+        # Re-center only when the window is actually broken, never just
+        # because it isn't where we last put it - a user dragging the editor
+        # anywhere on screen must always stick. "Broken" is: unreachable
+        # (title bar pushed above the top of the screen again, the exact
+        # JUCE-default failure place() exists to fix - some plugins restore
+        # this themselves from their own saved state on reopen), or resized
+        # by the plugin since we last centered it (RNNoise's delayed grow).
+        #
+        # -50 rather than 0: JUCE's off-screen default is roughly y=-31, but
+        # 0 would also catch a window deliberately dragged onto a second
+        # monitor positioned above the primary one (a valid multi-monitor
+        # layout, and legitimately negative in Windows' virtual-desktop
+        # coordinates) - which must be left alone like any other user drag.
+        cur_rect = wintypes.RECT()
+        user32.GetWindowRect(hwnd, ctypes.byref(cur_rect))
+        cur_size = (cur_rect.right - cur_rect.left, cur_rect.bottom - cur_rect.top)
+        if cur_rect.top < -50 or cur_size != last_size:
+            last_size = place(hwnd)
+
         time.sleep(TOPMOST_REASSERT_SECONDS)
 
 

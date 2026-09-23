@@ -765,6 +765,8 @@ class UIBuilderMixin:
                          command=self.export_audio_file)
         menu.add_command(label="Finished video (MP4)...",
                          command=self.export_video)
+        menu.add_command(label="Transcript only (.srt/.vtt/.txt)...",
+                         command=self.export_transcript_only)
         menu.add_separator()
         menu.add_checkbutton(label="Also write one WAV stem per speaker",
                              variable=self.export_stems)

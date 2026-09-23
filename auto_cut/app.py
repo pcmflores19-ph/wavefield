@@ -20,6 +20,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+from concurrent.futures import ThreadPoolExecutor
 from tkinter import filedialog, messagebox, ttk
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -30,7 +31,8 @@ import version
 import vst_host
 from app_actions import ActionsMixin
 from app_ui import UIBuilderMixin
-from audio_export import bake_processed_media, decode_audio_file, export_audio
+from audio_export import (_auto_render_workers, bake_processed_media,
+                          decode_audio_file, export_audio)
 from fcpxml_writer import write_fcpxml
 from transcript_export import export_alongside
 from fx_dialog import FxDialog
@@ -158,8 +160,11 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
         self.scenes = []                 # the resolved timeline
         # index -> ((path, duration), peaks) - skip recomputing a track's
         # peaks when neither has changed since the last computation. Cleared
-        # whenever tracks are (re)loaded.
+        # whenever tracks are (re)loaded. Guarded by a lock because
+        # _analyze_worker now reads/writes it from multiple speaker-analysis
+        # worker threads at once.
         self._peaks_cache = {}
+        self._peaks_cache_lock = threading.Lock()
         self._autosave_job = None
 
         self._build_ui()
@@ -515,25 +520,19 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
             saved = getattr(self, "_saved_speech", None)
             use_saved = bool(saved) and len(saved) == len(self.speaker_paths)
 
-            # Denoiser lookup is skipped entirely when every current path is
-            # a cache hit - the common case right after removing a track.
-            denoiser = None
+            # Each speaker's own probe/decode/denoise/VAD/peaks pipeline is
+            # independent of every other speaker's, so they run on a shared
+            # thread pool instead of one after another - the loop used to
+            # take as long as (all speakers combined), now it takes as long
+            # as the slowest one. Cache-hit classification stays sequential
+            # here first (cheap: an os.stat and a dict lookup per track) so
+            # the denoiser lookup can still be skipped entirely when every
+            # current path is a cache hit - the common case right after
+            # removing a track.
             cache = self._analysis_cache
-            speech_per_speaker = []
-            levels_per_speaker = []
-            peaks_list = []
-            audio_durations = []
-            hop = None
+            jobs = []  # (index, path, fingerprint, cached_entry_or_None)
+            needs_denoiser = False
             for index, path in enumerate(self.speaker_paths):
-                # This track's REAL decoded-audio length, not ffprobe's
-                # container/format duration (media[index].duration_seconds) -
-                # the two can disagree (encoder priming/padding, VFR video, a
-                # probe index that doesn't match the real stream), which is
-                # what made some waveforms appear shifted or flattened
-                # relative to the audio actually heard. See
-                # player.decoded_duration_seconds.
-                audio_duration = decoded_duration_seconds(path)
-                audio_durations.append(audio_duration)
                 # (size, mtime) of the file on disk right now - matches what
                 # player.decode_to_pcm's own cache key uses. Without this, a
                 # file replaced at the SAME path (a re-recording or
@@ -544,47 +543,46 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
                 stat = os.stat(path)
                 fingerprint = (stat.st_size, stat.st_mtime)
                 cached = cache.get(path)
-                if (cached is not None and cached["duration"] == duration
-                        and cached.get("fingerprint") == fingerprint):
-                    # Untouched since the last analysis (same path, same
-                    # file on disk, same shared timeline length) -
-                    # re-decoding would just reproduce this. duration is
-                    # part of the cache key because it changes the peaks
-                    # drawn for every track, not just the one that was added
-                    # or removed.
-                    self.log(f"Reusing analysis for {os.path.basename(path)}")
-                    intervals = cached["speech"]
-                    levels = cached["levels"]
-                    this_hop = cached["hop"]
-                    peaks = cached["peaks"]
-                elif use_saved:
-                    self.log(f"Analyzing waveforms of {os.path.basename(path)}")
-                    intervals = saved[index]
-                    levels = []
-                    this_hop = None
-                    # This track's OWN real duration, not the shared timeline
-                    # one - see _peaks_for's docstring for why the two must
-                    # never be conflated.
-                    peaks = self._peaks_for(index, path, audio_duration)
-                    cache[path] = {"duration": duration, "fingerprint": fingerprint,
-                                   "speech": intervals, "levels": levels,
-                                   "hop": this_hop, "peaks": peaks}
-                else:
-                    if denoiser is None:
-                        denoiser = voice_activity.find_denoiser()
-                    self.log(f"Analyzing waveforms of {os.path.basename(path)}")
-                    intervals, levels, this_hop = voice_activity.speaking_intervals(
-                        path, denoiser, duration=duration, log=self.log,
-                        with_levels=True)
-                    peaks = self._peaks_for(index, path, audio_duration)
-                    cache[path] = {"duration": duration, "fingerprint": fingerprint,
-                                   "speech": intervals, "levels": levels,
-                                   "hop": this_hop, "peaks": peaks}
-                speech_per_speaker.append(intervals)
-                levels_per_speaker.append(levels)
-                peaks_list.append(peaks)
-                if this_hop is not None:
-                    hop = this_hop
+                is_hit = (cached is not None and cached["duration"] == duration
+                         and cached.get("fingerprint") == fingerprint)
+                jobs.append((index, path, fingerprint, cached if is_hit else None))
+                if not is_hit and not use_saved:
+                    needs_denoiser = True
+            denoiser = voice_activity.find_denoiser() if needs_denoiser else None
+
+            speech_per_speaker = [None] * len(jobs)
+            levels_per_speaker = [None] * len(jobs)
+            peaks_list = [None] * len(jobs)
+            audio_durations = [None] * len(jobs)
+            hop = None
+            workers = self._auto_analysis_workers(len(jobs))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = [
+                    pool.submit(self._analyze_one_speaker, path, index,
+                               duration, denoiser, use_saved,
+                               saved[index] if use_saved else None, cached_entry)
+                    for index, path, fingerprint, cached_entry in jobs
+                ]
+                try:
+                    results = [f.result() for f in futures]
+                except Exception:
+                    for f in futures:
+                        f.cancel()
+                    raise
+
+            for (index, path, fingerprint, cached_entry), result in zip(jobs, results):
+                audio_durations[index] = result["audio_duration"]
+                speech_per_speaker[index] = result["speech"]
+                levels_per_speaker[index] = result["levels"]
+                peaks_list[index] = result["peaks"]
+                if result["hop"] is not None:
+                    hop = result["hop"]
+                if cached_entry is None:
+                    cache[path] = {
+                        "duration": duration, "fingerprint": fingerprint,
+                        "speech": result["speech"], "levels": result["levels"],
+                        "hop": result["hop"], "peaks": result["peaks"],
+                    }
             self._saved_speech = None
 
             self.log("Preparing audio for playback ...")
@@ -618,6 +616,75 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
             self.log(f"ERROR: {exc}")
             self.log(traceback.format_exc())
             self.root.after(0, lambda e=exc: self._analysis_failed(e))
+
+    def _analyze_one_speaker(self, path, index, duration, denoiser, use_saved,
+                             saved_intervals, cached_entry):
+        """
+        One speaker's decode/denoise/VAD/peaks pipeline, run on a worker
+        thread by _analyze_worker's pool - must not read or write any
+        other shared app state, since several of these can be running for
+        different speakers at once. self.log is safe to call concurrently
+        (queue.Queue-backed, see _poll_log_queue); self._peaks_for is safe
+        too (lock-protected, see its docstring). Every other result is
+        handed back to the caller, which does the actual cache bookkeeping
+        (self._analysis_cache) back on the main analysis thread once all
+        speakers have finished, so nothing here needs its own lock.
+        """
+        # This track's REAL decoded-audio length, not ffprobe's
+        # container/format duration (media[index].duration_seconds) - the
+        # two can disagree (encoder priming/padding, VFR video, a probe
+        # index that doesn't match the real stream), which is what made
+        # some waveforms appear shifted or flattened relative to the audio
+        # actually heard. See player.decoded_duration_seconds.
+        audio_duration = decoded_duration_seconds(path)
+        if cached_entry is not None:
+            # Untouched since the last analysis (same path, same file on
+            # disk, same shared timeline length) - re-decoding would just
+            # reproduce this. duration is part of the cache key because it
+            # changes the peaks drawn for every track, not just the one
+            # that was added or removed.
+            self.log(f"Reusing analysis for {os.path.basename(path)}")
+            return {
+                "audio_duration": audio_duration,
+                "speech": cached_entry["speech"],
+                "levels": cached_entry["levels"],
+                "hop": cached_entry["hop"],
+                "peaks": cached_entry["peaks"],
+            }
+        self.log(f"Analyzing waveforms of {os.path.basename(path)}")
+        if use_saved:
+            intervals = saved_intervals
+            levels = []
+            this_hop = None
+        else:
+            intervals, levels, this_hop = voice_activity.speaking_intervals(
+                path, denoiser, duration=duration, log=self.log,
+                with_levels=True)
+        # This track's OWN real duration, not the shared timeline one - see
+        # _peaks_for's docstring for why the two must never be conflated.
+        peaks = self._peaks_for(index, path, audio_duration)
+        return {
+            "audio_duration": audio_duration,
+            "speech": intervals,
+            "levels": levels,
+            "hop": this_hop,
+            "peaks": peaks,
+        }
+
+    def _auto_analysis_workers(self, track_count):
+        """
+        How many speakers to decode/denoise/analyze at once. Reuses
+        export's own RAM-tiered worker count (audio_export.
+        _auto_render_workers) rather than inventing a fresh heuristic -
+        each concurrent speaker analysis holds a comparable amount of
+        memory to a concurrent export render (a full raw decode plus a
+        full denoised/cleaned copy plus a resampled VAD copy), and there is
+        no separate measurement for analysis's own memory profile yet.
+        Capped at the number of tracks actually needing work and at the
+        CPU count, same shape as render_tracks' own worker cap.
+        """
+        return max(1, min(_auto_render_workers(), track_count,
+                          os.cpu_count() or 2))
 
     # ---------- transcription (separate from the edit) ----------
 
@@ -702,7 +769,7 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
                 words_per_speaker.append(words)
                 # Tag each segment with who said it - the transcript is a
                 # deliverable, and "who spoke" is most of its value.
-                speaker = os.path.splitext(os.path.basename(path))[0]
+                speaker = f"Speaker {index + 1}"
                 for segment in data["segments"]:
                     entry = dict(segment)
                     entry["speaker"] = speaker
@@ -2314,13 +2381,19 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
         every later peak earlier than where _draw_waveform looks for it.
         Confirmed by direct reproduction: real speech onsets/offsets came
         back reading as flat silence, worse the further into the track.
+
+        Called from multiple speaker-analysis worker threads at once (see
+        _analyze_one_speaker) - self._peaks_cache reads/writes are locked
+        so two tracks finishing at the same moment can't race on the dict.
         """
         fingerprint = (path, duration)
-        cached = self._peaks_cache.get(index)
-        if cached is not None and cached[0] == fingerprint:
-            return cached[1]
+        with self._peaks_cache_lock:
+            cached = self._peaks_cache.get(index)
+            if cached is not None and cached[0] == fingerprint:
+                return cached[1]
         peaks = processed_peaks(path, None, duration, log=self.log)
-        self._peaks_cache[index] = (fingerprint, peaks)
+        with self._peaks_cache_lock:
+            self._peaks_cache[index] = (fingerprint, peaks)
         return peaks
 
     # ---------- autosave ----------
@@ -2628,6 +2701,33 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
         except Exception as exc:
             self.log(f"ERROR exporting audio: {exc}")
             self.root.after(0, lambda e=exc: self._export_audio_failed(e))
+
+    def export_transcript_only(self):
+        """
+        Writes just the transcript (.srt/.vtt/.txt), with no video/audio
+        render - unlike every other export, this is cheap text formatting
+        with no ffmpeg/probing involved, so it runs synchronously on the UI
+        thread rather than via the usual background-thread + progress-dialog
+        machinery.
+        """
+        segments = (self.transcript or {}).get("segments", [])
+        if not segments:
+            messagebox.showwarning("No transcript",
+                                   "There's no transcript to export yet.")
+            return
+        keep_ranges, _ = self._current_keep_ranges()
+        default_name = os.path.splitext(os.path.basename(self.speaker_paths[0]))[0] + "_transcript.srt"
+        path = filedialog.asksaveasfilename(
+            title="Export Transcript", defaultextension=".srt",
+            initialfile=default_name,
+            filetypes=[("Subtitle files", "*.srt"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        written = export_alongside(path, segments, keep_ranges)
+        for p in written:
+            self.log(f"Wrote {os.path.basename(p)}")
+        messagebox.showinfo("Transcript exported", f"Wrote {len(written)} file(s).")
 
     def _track_render_progress(self, scale=1.0):
         """

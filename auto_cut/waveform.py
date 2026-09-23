@@ -5,7 +5,12 @@ The waveform is the real recording with the speaker's own VST chain on top,
 never the denoised copy the analysis works from - see processed_peaks.
 """
 
+import hashlib
+import os
+
 import numpy as np
+
+import settings
 
 # Peaks are extracted once at this resolution and re-bucketed in the UI when
 # zooming, so zooming never needs another decode. 50/s = 20ms per peak, fine
@@ -81,6 +86,17 @@ def reduce_to_peaks(samples, total, duration_seconds, sample_rate,
     return peaks
 
 
+def _peaks_cache_path(path, duration_seconds, peaks_per_second):
+    stat = os.stat(path)
+    key = hashlib.sha1(
+        f"{path}|{stat.st_size}|{stat.st_mtime}|{duration_seconds}|"
+        f"{peaks_per_second}|peaks".encode("utf-8")
+    ).hexdigest()
+    directory = settings.cache_dir()
+    os.makedirs(directory, exist_ok=True)
+    return os.path.join(directory, key + ".peaks.f32")
+
+
 def processed_peaks(path, chain, duration_seconds, log=None,
                     peaks_per_second=PEAKS_PER_SECOND):
     """
@@ -106,7 +122,25 @@ def processed_peaks(path, chain, duration_seconds, log=None,
     peaks). Chunk boundaries are invisible here: the output is one value per
     20ms, and the same audio is already monitored through 21ms blocks
     (player.py's stream blocksize).
+
+    Disk-cached only for the real `chain=None` path (the only one app.py
+    ever calls) - a track reopened after the app restarts skips this pass
+    entirely instead of redecoding and re-reducing an hour of audio just to
+    draw the same picture again. Keyed like voice_activity's caches
+    (content hash of path/size/mtime), plus duration and peaks_per_second
+    since both change how many buckets the same audio reduces to.
     """
+    cache_path = None
+    if chain is None:
+        cache_path = _peaks_cache_path(path, duration_seconds, peaks_per_second)
+        if os.path.exists(cache_path):
+            try:
+                cached = np.fromfile(cache_path, dtype=np.float32)
+                if cached.size:
+                    return cached
+            except Exception:
+                pass                        # fall through and rebuild it
+
     from player import SAMPLE_RATE, decode_to_pcm
 
     samples = np.memmap(decode_to_pcm(path), dtype=np.int16, mode="r")
@@ -118,6 +152,17 @@ def processed_peaks(path, chain, duration_seconds, log=None,
     if chain is not None and chain.active_slots():
         offline = chain.snapshot(log=log)
 
-    return reduce_to_peaks(samples, total, duration_seconds, SAMPLE_RATE,
-                           peaks_per_second=peaks_per_second, offline=offline,
-                           log=log)
+    peaks = reduce_to_peaks(samples, total, duration_seconds, SAMPLE_RATE,
+                            peaks_per_second=peaks_per_second, offline=offline,
+                            log=log)
+    if cache_path is not None:
+        try:
+            # Atomic like voice_activity's caches: a concurrent reader (e.g.
+            # this same speaker's cache-hit check above, on another analysis
+            # thread) never sees a partially-written file.
+            tmp_path = cache_path + ".part"
+            peaks.astype(np.float32).tofile(tmp_path)
+            os.replace(tmp_path, cache_path)
+        except Exception:
+            pass                            # a missed cache write is not fatal
+    return peaks

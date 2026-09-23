@@ -516,14 +516,23 @@ class NativeSlot:
 
 
 def _focus_editor_window(pid):
-    """Raises an already-open plugin window rather than opening a second one."""
+    """
+    Raises an already-open plugin window rather than opening a second one.
+
+    Returns True if a visible window belonging to `pid` was actually found
+    (and raised) - callers use this to tell "still genuinely open" apart
+    from "the process object hasn't reported exiting yet" (see
+    open_editor_subprocess: the child keeps running for a moment after its
+    window closes, to write its state back and exit cleanly).
+    """
     if os.name != "nt":
-        return
+        return False
     import ctypes
     from ctypes import wintypes
 
     user32 = ctypes.windll.user32
     enum_proc = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+    found = [False]
 
     def callback(hwnd, _lparam):
         window_pid = wintypes.DWORD()
@@ -531,6 +540,7 @@ def _focus_editor_window(pid):
         if window_pid.value == pid and user32.IsWindowVisible(hwnd):
             user32.ShowWindow(hwnd, 9)          # SW_RESTORE
             user32.SetForegroundWindow(hwnd)
+            found[0] = True
             return False
         return True
 
@@ -538,6 +548,7 @@ def _focus_editor_window(pid):
         user32.EnumWindows(enum_proc(callback), 0)
     except Exception:
         pass
+    return found[0]
 
 
 def _forward_editor_audio(slot, proc):
@@ -584,9 +595,15 @@ def open_editor_subprocess(slot, on_done=None, on_error=None):
     worker thread.
     """
     # Already open? Bring that window forward instead of spawning another.
+    # `poll() is None` alone isn't enough: closing the editor's window makes
+    # plugin_editor.py's main() return, but it still has to write the state
+    # back and exit, so the process object can look "alive" for a moment
+    # with no window left to show. Treating that as "still open" swallowed
+    # the click - the user had to click Open a second time before it did
+    # anything. Only short-circuit when a window is actually found.
     existing = getattr(slot, "editor_process", None)
-    if existing is not None and existing.poll() is None:
-        _focus_editor_window(existing.pid)
+    if existing is not None and existing.poll() is None \
+            and _focus_editor_window(existing.pid):
         if on_error:
             on_error("editor already open - brought it to the front")
         return
@@ -652,8 +669,16 @@ def open_editor_subprocess(slot, on_done=None, on_error=None):
             if on_error:
                 on_error(str(exc))
         finally:
-            slot.editor_process = None
-            slot.editor_audio_queue = None
+            # Only clear state that still belongs to THIS run. If the user
+            # closed this editor and reopened it fast enough, the "already
+            # open?" check above can fall through and start a second `proc`
+            # for the same slot while this one is still finishing its own
+            # shutdown (writing back state, then exiting) - unconditionally
+            # clearing here would wipe out the newer process's bookkeeping
+            # out from under it the moment this older run's cleanup fires.
+            if slot.editor_process is proc:
+                slot.editor_process = None
+                slot.editor_audio_queue = None
             if state_file and os.path.exists(state_file):
                 try:
                     os.remove(state_file)

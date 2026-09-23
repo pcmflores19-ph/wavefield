@@ -52,6 +52,21 @@ def aggressiveness_to_min_gap(aggressiveness):
     return MIN_GAP_SECONDS_AT_0 * (ratio ** t)
 
 
+def aggressiveness_to_padding(aggressiveness):
+    """
+    Slider position -> how much breathing room to leave around a cut.
+
+    Linear, unlike aggressiveness_to_min_gap's geometric curve - that curve
+    exists to correct for real pause lengths being unevenly distributed,
+    which has nothing to do with padding. Tapers to exactly 0 at 100, so the
+    most aggressive setting is not quietly softened by a padding constant
+    the slider otherwise never touches - at 100, PADDING_SECONDS used to
+    still apply in full, which could consume an entire minimum-length gap.
+    """
+    aggressiveness = max(0, min(100, aggressiveness))
+    return PADDING_SECONDS * (1.0 - aggressiveness / 100.0)
+
+
 def _merge_intervals(intervals):
     """Merges overlapping/touching (start, end) tuples, sorted by start."""
     if not intervals:
@@ -393,12 +408,14 @@ def compute_keep_ranges_from_intervals(per_speaker_intervals, timeline_start,
     so what the UI shades always matches what actually gets removed.
     """
     min_gap = aggressiveness_to_min_gap(aggressiveness)
+    padding = aggressiveness_to_padding(aggressiveness)
     merged = []
     for intervals in per_speaker_intervals:
         merged.extend(intervals)
     speaking = _merge_intervals(merged)
     gaps = find_silence_gaps(speaking, timeline_start, timeline_end, min_gap)
-    keep = gaps_to_keep_ranges(gaps, timeline_start, timeline_end)
+    keep = gaps_to_keep_ranges(gaps, timeline_start, timeline_end,
+                               padding_seconds=padding)
 
     if edits:
         keep = apply_edits(keep, edits)

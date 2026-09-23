@@ -28,6 +28,7 @@ changes the sound.
 """
 
 import hashlib
+import json
 import multiprocessing
 import os
 import tempfile
@@ -552,6 +553,39 @@ def cleaned_samples_for(path, denoiser_path=None, log=None):
     return cleaned
 
 
+def _vad_cache_path(path):
+    stat = os.stat(path)
+    key = hashlib.sha1(
+        f"{path}|{stat.st_size}|{stat.st_mtime}|vad|{SAMPLE_RATE}".encode("utf-8")
+    ).hexdigest()
+    directory = settings.cache_dir()
+    os.makedirs(directory, exist_ok=True)
+    return os.path.join(directory, key + ".vad.json")
+
+
+def _load_vad_cache(cache_path):
+    """The raw (pre-duration-clip) Silero intervals for a file, or None on
+    any cache miss/corruption - a missed read just means recomputing."""
+    try:
+        with open(cache_path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return [(float(s), float(e)) for s, e in data]
+    except Exception:
+        return None
+
+
+def _save_vad_cache(cache_path, intervals):
+    """Same atomic tmp+os.replace pattern as _cleaned_cache_path's writer,
+    so a reader on another analysis thread never sees a partial file."""
+    try:
+        tmp_path = cache_path + ".part"
+        with open(tmp_path, "w", encoding="utf-8") as fh:
+            json.dump(intervals, fh)
+        os.replace(tmp_path, cache_path)
+    except Exception:
+        pass                                # a missed cache write is not fatal
+
+
 def _gate(levels_db, hop_seconds):
     """Frame levels -> (start, end) speech intervals, via an adaptive gate."""
     if levels_db.size == 0:
@@ -636,14 +670,26 @@ def speaking_intervals(path, denoiser_path=None, duration=None, log=None,
 
     try:
         import silero_vad_onnx
-        # The memmap, not _load's float32 copy of it: the resample reads this
-        # a block at a time and scales as it goes, so the only full-length
-        # array anyone allocates is the 16kHz one the model actually needs -
-        # a third the length and the one that gets pickled to the child
-        # anyway. _load here cost 2.76GB on a 2-hour track before the VAD had
-        # even started.
-        raw = np.memmap(decode_to_pcm(path), dtype=np.int16, mode="r")
-        intervals = silero_vad_onnx.speaking_intervals(raw, SAMPLE_RATE)
+        # Raw (pre-duration-clip) intervals, disk-cached by content hash -
+        # Silero's ~112k sequential inference calls for a 1-hour track is
+        # the slowest single step in analysis, and unlike the PCM/cleaned-
+        # audio caches below, this result used to be recomputed on every
+        # app session even for a file that hadn't changed since the last
+        # one. Cached pre-clip (not keyed on `duration`) so it stays valid
+        # across a shared-timeline duration change caused by adding or
+        # removing an unrelated track.
+        vad_cache_path = _vad_cache_path(path)
+        intervals = _load_vad_cache(vad_cache_path)
+        if intervals is None:
+            # The memmap, not _load's float32 copy of it: the resample reads
+            # this a block at a time and scales as it goes, so the only
+            # full-length array anyone allocates is the 16kHz one the model
+            # actually needs - a third the length and the one that gets
+            # pickled to the child anyway. _load here cost 2.76GB on a
+            # 2-hour track before the VAD had even started.
+            raw = np.memmap(decode_to_pcm(path), dtype=np.int16, mode="r")
+            intervals = silero_vad_onnx.speaking_intervals(raw, SAMPLE_RATE)
+            _save_vad_cache(vad_cache_path, intervals)
     except Exception as exc:
         if log:
             log(f"  Silero VAD unavailable ({exc}); falling back to the energy gate")
