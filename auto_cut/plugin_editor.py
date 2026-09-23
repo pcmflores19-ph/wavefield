@@ -21,8 +21,11 @@ import struct
 import sys
 import threading
 import time
+import types
 
 import numpy as np
+
+import channel_adapt
 
 # How often the plugin's state is checked while its editor is open. Fast enough
 # that a knob move is audible almost immediately, slow enough not to thrash.
@@ -358,6 +361,11 @@ def main():
 
     def feed_audio():
         first = True
+        # A plugin that rejects the mono feed (PodcastPlugins TRACK/MASTER)
+        # gets the layout it asks for instead - the same adapter
+        # vst_host.TrackChain uses. Without it this loop dies on the first
+        # block and the plugin's meters never move.
+        feed = types.SimpleNamespace(channels=1)
         while True:
             header = _read_exact(4)
             if header is None:
@@ -369,7 +377,8 @@ def main():
             try:
                 buf = np.frombuffer(payload, dtype=np.float32).reshape(1, -1)
                 with plugin_lock:
-                    plugin.process(buf, sample_rate, reset=first)
+                    channel_adapt.process_mono(
+                        plugin.process, feed, buf, sample_rate, first)
                 first = False
             except Exception:
                 return

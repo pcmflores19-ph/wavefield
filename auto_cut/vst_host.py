@@ -24,6 +24,7 @@ import time
 import numpy
 
 import bundled
+import channel_adapt
 
 # How much audio a plugin gets at a time when it could not manage the whole
 # track at once. Long enough that the joins are rare, short enough that any
@@ -455,6 +456,14 @@ class PluginSlot:
         # this slot's prior render. Cleared by app.py after a successful bake.
         self.dirty = False
         self.revision = 0
+        # How many copies of the mono track this plugin is fed. Raised from 1
+        # once it rejects a mono buffer (PodcastPlugins TRACK/MASTER only offer
+        # a 2-in/2-out bus) - see channel_adapt.process_mono.
+        self.channels = 1
+        # Why the last processing pass skipped this plugin, or None if it was
+        # applied. Written from whichever thread ran the pass and only read
+        # for display, so a stale value is harmless.
+        self.last_error = None
 
     def mark_dirty(self):
         self.dirty = True
@@ -866,12 +875,28 @@ class TrackChain:
                         else:
                             buf = self._run_plugin(slot, buf, sample_rate,
                                                    reset, log)
+                            slot.last_error = None
                 except Exception as exc:
+                    slot.last_error = str(exc) or type(exc).__name__
                     if log:
                         log(f"  {slot.name}: could not process this audio "
                             f"({exc}) - it is NOT applied here")
                     continue
         return buf.reshape(-1)
+
+    @staticmethod
+    def _call_plugin(slot, audio, sample_rate, reset, log=None):
+        """
+        `slot.plugin(audio, ...)`, for mono `audio` of shape (1, n), adapted
+        to whatever channel layout the plugin insists on - see channel_adapt.
+        """
+        before = slot.channels
+        out = channel_adapt.process_mono(slot.plugin, slot, audio,
+                                         sample_rate, reset)
+        if log and slot.channels != before:
+            log(f"  {slot.name}: needs {slot.channels} input channels; "
+                f"feeding the mono track on all of them")
+        return out
 
     @staticmethod
     def _run_plugin(slot, buf, sample_rate, reset, log):
@@ -882,7 +907,7 @@ class TrackChain:
         """
         length = buf.shape[1]
         try:
-            out = slot.plugin(buf, sample_rate, reset=reset)
+            out = TrackChain._call_plugin(slot, buf, sample_rate, reset, log)
         except Exception as exc:
             if log:
                 log(f"  {slot.name}: {exc}; retrying in chunks")
@@ -899,8 +924,8 @@ class TrackChain:
             out = None
             for index, offset in enumerate(range(0, length, step)):
                 piece = buf[:, offset:offset + step]
-                result = slot.plugin(piece, sample_rate,
-                                     reset=(reset and index == 0))
+                result = TrackChain._call_plugin(
+                    slot, piece, sample_rate, (reset and index == 0), log)
                 if index == 0:
                     if result.shape[1] != piece.shape[1]:
                         raise RuntimeError(

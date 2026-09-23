@@ -667,6 +667,8 @@ class FxDialog(tk.Toplevel):
         self.chain_list.delete(0, "end")
         for slot in self.chain.slots:
             label = f"{slot.name}   [bypassed]" if slot.bypassed else slot.name
+            if getattr(slot, "last_error", None) and not slot.bypassed:
+                label += "   [not applied - see log]"
             self.chain_list.insert("end", label)
         if keep is not None and keep < self.chain_list.size():
             self.chain_list.selection_set(keep)

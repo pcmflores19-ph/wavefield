@@ -48,6 +48,15 @@ rnnoise / noise-suppression-for-voice
 Unmodified binary from the project's own release, loaded at runtime as a
 plugin. The complete corresponding source is at the address above.
 
+PodcastPlugins TRACK  (pp-track.vst3)
+  Licence : GNU General Public License version 3
+  Source  : https://github.com/trummerschlunk/PodcastPlugins
+  Release : 1.0.0  (podcast-plugins-1.0.0-src.tar.xz is the matching source)
+  Authors : Klaus Scheuermann (DSP, in Faust), falkTX (plugin framework, DPF)
+
+Unmodified binary from the project's own 1.0.0 Windows release, loaded at
+runtime as a plugin. The complete corresponding source is at the address above.
+
 The gate, compressor, expander, limiter, EQ and gain are Wavefield's own code
 (auto_cut/effects.py), ported from OBS Studio's filters - not bundled plugins.
 
