@@ -675,9 +675,13 @@ def speaking_intervals(path, denoiser_path=None, duration=None, log=None,
         # the slowest single step in analysis, and unlike the PCM/cleaned-
         # audio caches below, this result used to be recomputed on every
         # app session even for a file that hadn't changed since the last
-        # one. Cached pre-clip (not keyed on `duration`) so it stays valid
-        # across a shared-timeline duration change caused by adding or
-        # removing an unrelated track.
+        # one. Cached pre-clip (not keyed on `duration`) so a caller can
+        # re-clip the same cached intervals to a different bound without
+        # forcing a recompute - `duration` here is always this track's own
+        # decoded length (see app.py's _analyze_one_speaker), which is
+        # intrinsic to the file and never changes on its own, but keeping
+        # the cache pre-clip still means a caller wanting some other bound
+        # doesn't pay for a fresh Silero pass just to get it.
         vad_cache_path = _vad_cache_path(path)
         intervals = _load_vad_cache(vad_cache_path)
         if intervals is None:

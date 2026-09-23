@@ -830,8 +830,12 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
                 self.log(f"  {len(words)} words, {len(data['segments'])} segments")
                 words_per_speaker.append(words)
                 # Tag each segment with who said it - the transcript is a
-                # deliverable, and "who spoke" is most of its value.
-                speaker = f"Speaker {index + 1}"
+                # deliverable, and "who spoke" is most of its value. Matches
+                # audio_track_name's naming (the mixer/waveform UI already
+                # labels this same track by its filename stem), so a
+                # transcript and the rest of the app never disagree about
+                # who a given track/lane actually is.
+                speaker = self.speaker_stem(index)
                 for segment in data["segments"]:
                     entry = dict(segment)
                     entry["speaker"] = speaker
