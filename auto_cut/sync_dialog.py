@@ -49,7 +49,10 @@ class SyncDialog(tk.Toplevel):
                        "sound each mic picked up. Each row below shows what "
                        "was detected automatically; tick \"Manual\" on a row "
                        "to type your own offset instead - the only way this "
-                       "changes anything is if you tick it and enter a value."
+                       "changes anything is if you tick it and enter a value. "
+                       "A positive offset means that track has extra lead-in "
+                       "to trim (it shifts earlier); negative pads silence "
+                       "onto its start (it shifts later)."
                   ).pack(anchor="w", pady=(0, 10))
 
         ttk.Label(frame, text="Align to", style="Panel.TLabel").pack(anchor="w")

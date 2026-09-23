@@ -47,6 +47,7 @@ from whisperx_runner import language_label, model_label, transcribe
 
 LANE_HEIGHT = 74             # per-speaker waveform lane
 RULER_HEIGHT = 18
+PLAYHEAD_HIT_PX = 5          # how close a press has to be to grab the playhead
 
 # A sample this close to full scale is an over. Drawn red, like any DAW, and
 # always measured on the true sample - never on the zoomed height - so
@@ -669,6 +670,12 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
         self.timeline_duration = results["timeline_duration"]
         self.peaks_list = results["peaks_list"]
         self.auto_mutes = results["auto_mutes"]
+        # _apply_edits() is the only place that pushes mute ranges into
+        # track.mute_ranges (what playback actually reads) - without this
+        # call here, a fresh analysis pass would leave the waveform showing
+        # newly auto-muted regions while the player still played through
+        # them, until an unrelated hand edit called _apply_edits() first.
+        self._apply_edits()
         self.playhead = None
         self.view_start = 0.0
         self.view_span = results["view_span"]
@@ -1654,7 +1661,7 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
             bottom = lanes_bottom + (SCENE_STRIP_HEIGHT
                                      if self.scene_switching.get() else 0)
             self._playhead_line_id = self.canvas.create_line(
-                x, RULER_HEIGHT, x, bottom, fill="#ffcc44", width=2)
+                x, RULER_HEIGHT, x, bottom, fill=ui_theme.ACCENT, width=2)
 
         self._sync_scrollbar(start, span)
         self.zoom_label.config(
@@ -1950,6 +1957,19 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
         if event.state & 0x0001:
             self._pan_anchor = (event.x, self.view_start)
             return
+        # A press near the playhead line grabs it for scrubbing, taking
+        # priority over lane selection and the camera strip beneath it.
+        if self.playhead is not None:
+            width = max(self.canvas.winfo_width(), 1)
+            start, span = self._view_bounds()
+            if start <= self.playhead <= start + span:
+                px = self._time_to_x(self.playhead, width, start, span)
+                if abs(event.x - px) <= PLAYHEAD_HIT_PX:
+                    self._playhead_drag = True
+                    self.playhead = self._x_to_time(event.x)
+                    self.player.seek(self.playhead)
+                    self._update_playhead_position()
+                    return
         # Dragging on the CAMERAS strip assigns that camera directly - the
         # row you drag along IS the camera you get.
         camera = self._scene_row_at(self._canvas_y(event))
@@ -1963,6 +1983,11 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
         self._drag_anchor = (event.x, self._x_to_time(event.x), lane)
 
     def _on_drag(self, event):
+        if getattr(self, "_playhead_drag", False):
+            self.playhead = self._x_to_time(event.x)
+            self.player.seek(self.playhead)
+            self._update_playhead_position()
+            return
         pan = getattr(self, "_pan_anchor", None)
         if pan is not None:
             width = max(self.canvas.winfo_width(), 1)
@@ -1989,6 +2014,9 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
         self._update_edit_labels()
 
     def _on_release(self, event):
+        if getattr(self, "_playhead_drag", False):
+            self._playhead_drag = False
+            return
         if getattr(self, "_pan_anchor", None) is not None:
             self._pan_anchor = None
             return
@@ -2935,9 +2963,19 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
                 "are added.")
             return
 
-        # Speaker 0 is the one that becomes V1 in the timeline export; use the
-        # same convention here so the result matches what Resolve would show.
-        source = self.speaker_paths[0]
+        # The highest-numbered track with a picture is the video source -
+        # same convention Resolve uses for its own V1/V2/V3 stack, where a
+        # higher video track covers whatever is beneath it. Audio-only
+        # tracks are never candidates, so an audio-only mic added later
+        # can't bump the picture.
+        video_tracks = [p for p, m in zip(self.speaker_paths, self.speaker_media)
+                        if getattr(m, "has_video", False)]
+        if not video_tracks:
+            messagebox.showwarning("No picture to export",
+                                   "None of your tracks have a picture - "
+                                   "add a video track.")
+            return
+        source = video_tracks[-1]
         default_name = (os.path.splitext(os.path.basename(source))[0]
                         + "_autocut.mp4")
         path = filedialog.asksaveasfilename(

@@ -136,6 +136,45 @@ def _apply_envelope_gain(samples, attack_gain, release_gain, threshold_db,
 
 # --------------------------------------------------------------------- gate
 
+def _gate_loop(samples, open_level, close_level, attack_rate, release_rate,
+              decay_rate, hold_seconds, dt, level, attenuation, held,
+              is_open):
+    """
+    The per-sample gate state machine - see noise_gate's docstring. Split
+    out (same reasoning as _envelope above) so it can be numba-compiled:
+    genuinely sequential, each output depends on the state the previous
+    sample left behind.
+    """
+    out = np.empty_like(samples)
+    for i in range(samples.size):
+        current = abs(samples[i])
+        if current > open_level:
+            is_open = True
+        level = max(level, current)
+        if level < close_level and is_open:
+            held = 0.0
+            is_open = False
+        level = max(0.0, level - decay_rate)
+
+        if is_open:
+            attenuation = min(1.0, attenuation + attack_rate)
+        else:
+            held += dt
+            if held < hold_seconds:
+                attenuation = min(1.0, attenuation + attack_rate)
+            else:
+                attenuation = max(0.0, attenuation - release_rate)
+        out[i] = samples[i] * attenuation
+    return out, level, attenuation, held, is_open
+
+
+try:                                    # 50-100x faster, optional
+    from numba import njit
+    _gate_loop = njit(cache=True, fastmath=True)(_gate_loop)
+except Exception:
+    pass
+
+
 def noise_gate(samples, sample_rate, open_threshold_db=-26.0,
                close_threshold_db=-32.0, attack_ms=25.0, hold_ms=200.0,
                release_ms=150.0, state=None):
@@ -159,7 +198,6 @@ def noise_gate(samples, sample_rate, open_threshold_db=-26.0,
     # OBS's decay: how fast the measured level is allowed to fall.
     decay_rate = 1.0 / max(1e-6, sample_rate * (release_ms / 1000.0))
 
-    out = np.empty_like(samples)
     if state is None:
         level = 0.0
         attenuation = 0.0
@@ -176,25 +214,9 @@ def noise_gate(samples, sample_rate, open_threshold_db=-26.0,
         is_open = state.get("is_open", False)
     dt = 1.0 / sample_rate
 
-    for i in range(samples.size):
-        current = abs(float(samples[i]))
-        if current > open_level:
-            is_open = True
-        level = max(level, current)
-        if level < close_level and is_open:
-            held = 0.0
-            is_open = False
-        level = max(0.0, level - decay_rate)
-
-        if is_open:
-            attenuation = min(1.0, attenuation + attack_rate)
-        else:
-            held += dt
-            if held < hold_seconds:
-                attenuation = min(1.0, attenuation + attack_rate)
-            else:
-                attenuation = max(0.0, attenuation - release_rate)
-        out[i] = samples[i] * attenuation
+    out, level, attenuation, held, is_open = _gate_loop(
+        samples, open_level, close_level, attack_rate, release_rate,
+        decay_rate, hold_seconds, dt, level, attenuation, held, is_open)
 
     if state is not None:
         state["level"] = level
@@ -308,6 +330,26 @@ def gain(samples, sample_rate, gain_db=0.0, state=None):
     return samples * float(_db_to_mul(gain_db))
 
 
+def _one_pole_loop(x, a, s):
+    """
+    The per-sample one-pole IIR recurrence - see eq3's one_pole_low. Split
+    out (same reasoning as _envelope/_gate_loop above) so it can be
+    numba-compiled: genuinely sequential, each output depends on the last.
+    """
+    out = np.empty_like(x)
+    for i in range(x.size):
+        s = (1.0 - a) * x[i] + a * s
+        out[i] = s
+    return out, s
+
+
+try:                                    # 50-100x faster, optional
+    from numba import njit
+    _one_pole_loop = njit(cache=True, fastmath=True)(_one_pole_loop)
+except Exception:
+    pass
+
+
 def eq3(samples, sample_rate, low_db=0.0, mid_db=0.0, high_db=0.0,
        state=None):
     """
@@ -326,9 +368,12 @@ def eq3(samples, sample_rate, low_db=0.0, mid_db=0.0, high_db=0.0,
         y[n] = (1-a)*x[n] + a*y[n-1]
 
         A one-pole IIR: each output depends on the last, so it cannot be
-        vectorised. scipy does it in C when available - roughly a hundred times
-        faster over a full episode - and the loop is the fallback, since the
-        frozen build deliberately excludes scipy to keep the installer small.
+        vectorised. scipy does it in C when available and is tried first,
+        but the frozen build deliberately excludes scipy to keep the
+        installer small (packaging/autocut.spec) - every real (packaged)
+        user therefore always falls through to _one_pole_loop below, so that
+        fallback has to be genuinely fast, not just correct. It is:
+        numba-jitted the same way _envelope/_gate_loop above are.
         """
         a = float(np.exp(-2.0 * np.pi * cutoff / sample_rate))
         try:
@@ -342,11 +387,8 @@ def eq3(samples, sample_rate, low_db=0.0, mid_db=0.0, high_db=0.0,
             return y.astype(np.float32)
         except Exception:
             pass
-        out = np.empty_like(x)
         s = (state.get(key + "_py", 0.0) if state is not None else 0.0)
-        for i in range(x.size):
-            s = (1.0 - a) * x[i] + a * s
-            out[i] = s
+        out, s = _one_pole_loop(x, a, s)
         if state is not None:
             state[key + "_py"] = s
         return out

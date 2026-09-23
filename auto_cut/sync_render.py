@@ -15,7 +15,7 @@ import subprocess
 import bundled
 import settings
 from media_probe import probe
-from video_export import has_nvenc, cpu_video_codec
+from video_export import detect_gpu_encoder, gpu_video_codec, cpu_video_codec
 
 FFMPEG = bundled.tool("ffmpeg")
 
@@ -27,9 +27,9 @@ _CRF = 18
 
 
 def _video_codec(width, height, fps):
-    if has_nvenc():
-        return ["-c:v", "h264_nvenc", "-preset", "p4",
-                "-rc", "vbr", "-cq", str(_CRF), "-b:v", "0"]
+    encoder = detect_gpu_encoder()
+    if encoder:
+        return gpu_video_codec(encoder, _CRF)
     # libopenh264, not libx264 - see video_export.cpu_video_codec's
     # docstring: this bundled ffmpeg build has no libx264 at all.
     return cpu_video_codec(width, height, fps)

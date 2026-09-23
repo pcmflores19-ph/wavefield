@@ -43,8 +43,8 @@ NL = chr(10)
 
 # Constant Rate Factor. 20 is visually near-identical to a typical screen or
 # webcam recording while roughly halving the size; lower is bigger and better.
-# Only meaningful for NVENC (-cq) - the CPU fallback has no CRF-equivalent
-# mode, see cpu_video_codec().
+# Only meaningful for a GPU encoder's quality mode (-cq/-qp/-global_quality)
+# - the CPU fallback has no CRF-equivalent mode, see cpu_video_codec().
 DEFAULT_CRF = 20
 
 # Bits per pixel per frame for the CPU fallback's target bitrate - see
@@ -96,48 +96,68 @@ def _cpu_encode_workers():
 
 def _gpu_encode_workers():
     """
-    How many concurrent NVENC segment encodes to attempt.
+    How many concurrent GPU segment encodes to attempt.
 
-    Deliberately not probed upfront the way has_nvenc() probes basic
-    availability - testing *concurrent* NVENC would cost a real second
-    encode, not two throwaway frames. Many budget/laptop GPUs (common
-    hardware for this app's podcaster users) support only one concurrent
-    NVENC session; some newer cards support several. Start at a
-    conservative 2 and let _encode_segments' own retry-at-1 handle a GPU
-    that turns out not to support this - see its docstring.
+    Deliberately not probed upfront the way detect_gpu_encoder() probes
+    basic availability - testing *concurrent* sessions would cost a real
+    second encode, not two throwaway frames. Many budget/laptop GPUs
+    (common hardware for this app's podcaster users) support only one
+    concurrent hardware encode session; some newer cards support several.
+    Start at a conservative 2 and let _encode_segments' own retry-at-1
+    handle a GPU that turns out not to support this - see its docstring.
     """
     return 2
 
 
-_nvenc_cache = None
+# Tried in this order - NVENC first since it's the vendor this app's
+# podcaster users most often have and the one this fallback chain was
+# originally built and tested against; AMD/Intel added alongside it so
+# export uses whatever GPU is actually present instead of only NVIDIA.
+_GPU_ENCODERS = ("h264_nvenc", "h264_amf", "h264_qsv")
+
+_GPU_ENCODER_LABELS = {
+    "h264_nvenc": "NVIDIA GPU",
+    "h264_amf": "AMD GPU",
+    "h264_qsv": "Intel GPU",
+}
+
+_gpu_encoder_cache = None
 
 
-def has_nvenc():
+def detect_gpu_encoder():
     """
-    Whether NVIDIA hardware encoding actually WORKS here.
+    Which GPU hardware encoder actually WORKS here, if any (an ffmpeg
+    encoder name from _GPU_ENCODERS, or None).
 
-    Listing the encoders is not enough - it only says NVENC was compiled in.
-    On this development machine ffmpeg lists h264_nvenc and then fails with
-    "Driver does not support the required nvenc API version. Required: 13.1
-    Found: 13.0", because the bundled ffmpeg is newer than the installed
-    driver. The only reliable test is to encode something.
+    Listing the encoders is not enough - it only says the encoder was
+    compiled in. On this development machine ffmpeg lists h264_nvenc and
+    then fails with "Driver does not support the required nvenc API
+    version. Required: 13.1 Found: 13.0", because the bundled ffmpeg is
+    newer than the installed driver - the same gap can happen for AMF/QSV
+    against an old GPU driver. The only reliable test is to encode
+    something.
 
-    So: two frames of black, to nowhere. Costs a fraction of a second, once.
+    So: two frames of black, to nowhere, per candidate encoder. Costs a
+    fraction of a second each, once, cached after that.
     """
-    global _nvenc_cache
-    if _nvenc_cache is not None:
-        return _nvenc_cache
-    try:
-        result = subprocess.run(
-            [FFMPEG, "-hide_banner", "-f", "lavfi",
-             "-i", "color=black:s=256x256:d=0.1",
-             "-c:v", "h264_nvenc", "-f", "null", "-"],
-            capture_output=True, text=True, timeout=60,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        _nvenc_cache = result.returncode == 0
-    except Exception:
-        _nvenc_cache = False
-    return _nvenc_cache
+    global _gpu_encoder_cache
+    if _gpu_encoder_cache is not None:
+        return _gpu_encoder_cache or None
+    for encoder in _GPU_ENCODERS:
+        try:
+            result = subprocess.run(
+                [FFMPEG, "-hide_banner", "-f", "lavfi",
+                 "-i", "color=black:s=256x256:d=0.1",
+                 "-c:v", encoder, "-f", "null", "-"],
+                capture_output=True, text=True, timeout=60,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            if result.returncode == 0:
+                _gpu_encoder_cache = encoder
+                return encoder
+        except Exception:
+            continue
+    _gpu_encoder_cache = ""
+    return None
 
 
 def cpu_video_codec(width, height, fps):
@@ -159,6 +179,26 @@ def cpu_video_codec(width, height, fps):
     bitrate = max(1_500_000, int(width * height * float(fps)
                                  * _CPU_BITS_PER_PIXEL))
     return ["-c:v", "libopenh264", "-rc_mode", "quality", "-b:v", str(bitrate)]
+
+
+def gpu_video_codec(encoder, crf):
+    """
+    Encoder args for one detect_gpu_encoder() result, each in that vendor's
+    quality-target mode (comparable in spirit to CRF) rather than a fixed
+    bitrate - see DEFAULT_CRF.
+    """
+    if encoder == "h264_nvenc":
+        # -cq on its own is rejected with "Invalid argument" - rc must be
+        # named explicitly.
+        return ["-c:v", "h264_nvenc", "-preset", "p4",
+                "-rc", "vbr", "-cq", str(crf), "-b:v", "0"]
+    if encoder == "h264_amf":
+        return ["-c:v", "h264_amf", "-rc", "cqp",
+                "-qp_i", str(crf), "-qp_p", str(crf), "-qp_b", str(crf)]
+    if encoder == "h264_qsv":
+        return ["-c:v", "h264_qsv", "-preset", "medium",
+                "-global_quality", str(crf)]
+    raise ValueError(f"unknown GPU encoder: {encoder!r}")
 
 
 def _conform_vf(width, height, fps, src_width=None, src_height=None,
@@ -209,7 +249,7 @@ def _two_stage_seek(start):
     return fast_seek, start - fast_seek
 
 
-def _bookend_input(path, seconds, width, height, fps, use_gpu=False):
+def _bookend_input(path, seconds, width, height, fps, gpu_encoder=None):
     """
     ffmpeg input arguments for one bookend, its kind, and (for a video
     bookend) its probed source dimensions and frame rate - used the same
@@ -228,8 +268,11 @@ def _bookend_input(path, seconds, width, height, fps, use_gpu=False):
             info = probe(path)
             if info.has_video:
                 # Trimmed to the audio length so picture and sound agree even
-                # if the file is slightly longer.
-                hwaccel = ["-hwaccel", "cuda"] if use_gpu else []
+                # if the file is slightly longer. cuda hwaccel decode is only
+                # wired up for NVENC - see the segment loop in render() for
+                # the same choice.
+                hwaccel = (["-hwaccel", "cuda"]
+                          if gpu_encoder == "h264_nvenc" else [])
                 return (hwaccel + ["-t", f"{seconds:.6f}", "-i", path],
                         "video", info.width, info.height, info.fps)
         except Exception:
@@ -354,11 +397,12 @@ def _encode_segments(clip_specs, video_codec, use_gpu, aggregator,
     chosen conservatively for the kind of modest hardware this app's
     podcaster users often have.
 
-    A NVENC session limit is a real risk on budget/laptop GPUs (some
-    support only one concurrent encode) and isn't something worth probing
-    upfront the way `has_nvenc()` probes basic availability - testing
-    *concurrent* NVENC would cost a real second encode, not two throwaway
-    frames. So instead: if running at concurrency >1 on the GPU path fails
+    A hardware encoder session limit is a real risk on budget/laptop GPUs
+    (some support only one concurrent encode) and isn't something worth
+    probing upfront the way `detect_gpu_encoder()` probes basic
+    availability - testing *concurrent* sessions would cost a real second
+    encode, not two throwaway frames. So instead: if running at concurrency
+    >1 on the GPU path fails
     at all, retry the whole batch once at concurrency 1 before giving up.
     If it still fails, the error is left to `render()`'s own outer handler,
     which already restarts the whole video phase on CPU for a genuine GPU
@@ -461,21 +505,21 @@ def render(video_path, audio_path, out_path, keep_ranges, crf=DEFAULT_CRF,
     source_infos = [info] + [probe(s) for s in sources[1:]]
     total = (sum(end - start for _source, start, end in segments)
              + intro_seconds + outro_seconds)
+    gpu_encoder = detect_gpu_encoder() if use_gpu is not False else None
     if use_gpu is None:
-        use_gpu = has_nvenc()
+        use_gpu = gpu_encoder is not None
+    elif use_gpu and gpu_encoder is None:
+        use_gpu = False   # asked for GPU but none actually works here
 
-    # NVENC needs a rate-control mode named explicitly; -cq on its own is
-    # rejected with "Invalid argument" and no useful explanation.
-    gpu_codec = ["-c:v", "h264_nvenc", "-preset", "p4",
-                 "-rc", "vbr", "-cq", str(crf), "-b:v", "0"]
-    cpu_codec = cpu_video_codec(info.width, info.height, info.fps)
-    video_codec = gpu_codec if use_gpu else cpu_codec
+    video_codec = (gpu_video_codec(gpu_encoder, crf) if use_gpu
+                  else cpu_video_codec(info.width, info.height, info.fps))
 
     rate = f"{float(info.fps):.6f}"
     width, height = info.width, info.height
 
     if progress:
-        progress(0.0, f"encoding with {'GPU' if use_gpu else 'CPU'} "
+        label = _GPU_ENCODER_LABELS.get(gpu_encoder, "GPU") if use_gpu else "CPU"
+        progress(0.0, f"encoding with {label} "
                       f"({total / 60:.1f} min of video)")
 
     temp_dir = tempfile.mkdtemp(prefix="wavefield_video_")
@@ -484,9 +528,11 @@ def render(video_path, audio_path, out_path, keep_ranges, crf=DEFAULT_CRF,
         aggregator = _ProgressAggregator(total, progress, "Encoding video...")
 
         intro_args, intro_kind, intro_w, intro_h, intro_fps = _bookend_input(
-            intro_path, intro_seconds, width, height, rate, use_gpu=use_gpu)
+            intro_path, intro_seconds, width, height, rate,
+            gpu_encoder=gpu_encoder)
         outro_args, outro_kind, outro_w, outro_h, outro_fps = _bookend_input(
-            outro_path, outro_seconds, width, height, rate, use_gpu=use_gpu)
+            outro_path, outro_seconds, width, height, rate,
+            gpu_encoder=gpu_encoder)
         if progress and (intro_kind == "video" or outro_kind == "video"):
             progress(0.0, "using the picture from your intro/outro")
 
@@ -518,7 +564,7 @@ def render(video_path, audio_path, out_path, keep_ranges, crf=DEFAULT_CRF,
                                           and src_info.fps == info.fps))
             fast_seek, residual = _two_stage_seek(start)
             input_args = []
-            if use_gpu:
+            if gpu_encoder == "h264_nvenc":
                 input_args += ["-hwaccel", "cuda"]
             input_args += ["-ss", f"{fast_seek:.6f}", "-i", sources[source],
                            "-ss", f"{residual:.6f}", "-t", f"{duration:.6f}"]
@@ -585,10 +631,10 @@ def render(video_path, audio_path, out_path, keep_ranges, crf=DEFAULT_CRF,
         # -hwaccel cuda decode failing for a source the GPU decoder can't
         # handle. The CPU path is slower but always works, and is far better
         # than handing someone an ffmpeg backtrace. Restarts the whole video
-        # phase on CPU rather than mixing NVENC- and libx264-encoded clips in
-        # one concat, which is untested and a real corruption/desync risk.
-        if use_gpu and ("nvenc" in lowered or "cuda" in lowered
-                        or "hwaccel" in lowered):
+        # phase on CPU rather than mixing GPU- and libopenh264-encoded clips
+        # in one concat, which is untested and a real corruption/desync risk.
+        if use_gpu and any(kw in lowered for kw in
+                           ("nvenc", "cuda", "hwaccel", "amf", "qsv")):
             if progress:
                 progress(0.0, "GPU encoder unavailable - encoding on the "
                               "processor instead (slower)")
