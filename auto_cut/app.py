@@ -47,7 +47,9 @@ from whisperx_runner import language_label, model_label, transcribe
 
 LANE_HEIGHT = 74             # per-speaker waveform lane
 RULER_HEIGHT = 18
-PLAYHEAD_HIT_PX = 5          # how close a press has to be to grab the playhead
+PLAYHEAD_HEAD_HALF_W = 6     # half the width of the triangle atop the playhead
+PLAYHEAD_HIT_PX = 6          # how close a press has to be to grab the playhead
+                             # (as wide as the triangle, so all of it grabs)
 
 # A sample this close to full scale is an over. Drawn red, like any DAW, and
 # always measured on the true sample - never on the zoomed height - so
@@ -124,6 +126,7 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
         self._audio_durations = []
         self.playhead = None
         self._playhead_line_id = None  # canvas item, moved in place during playback
+        self._playhead_head_id = None  # the triangle in the ruler, moved with it
         self.view_start = 0.0
         self.view_span = 0.0
         # Vertical magnification of the drawn waveform only. The peaks
@@ -1656,12 +1659,17 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
         self._draw_scene_lane(width, start, span, lanes_bottom)
 
         self._playhead_line_id = None
+        self._playhead_head_id = None
         if self.playhead is not None and start <= self.playhead <= start + span:
             x = self._time_to_x(self.playhead, width, start, span)
             bottom = lanes_bottom + (SCENE_STRIP_HEIGHT
                                      if self.scene_switching.get() else 0)
             self._playhead_line_id = self.canvas.create_line(
                 x, RULER_HEIGHT, x, bottom, fill=ui_theme.ACCENT, width=2)
+            # Created last so it sits on top of the ruler's time labels.
+            self._playhead_head_id = self.canvas.create_polygon(
+                *self._playhead_head_points(x),
+                fill=ui_theme.ACCENT, outline="")
 
         self._sync_scrollbar(start, span)
         self.zoom_label.config(
@@ -2305,6 +2313,13 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
                 self._refresh_transport()      # stream ended on its own
         self._tick_job = self.root.after(60, self._tick)
 
+    @staticmethod
+    def _playhead_head_points(x):
+        """The playhead's marker: a downward triangle in the ruler whose tip
+        lands on the top of the line, as in a DAW."""
+        half = PLAYHEAD_HEAD_HALF_W
+        return (x - half, 2, x + half, 2, x, RULER_HEIGHT)
+
     def _update_playhead_position(self):
         """
         Moves just the playhead line, instead of the full _draw_waveform()
@@ -2334,9 +2349,11 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
         bottom = lanes_bottom + (SCENE_STRIP_HEIGHT
                                  if self.scene_switching.get() else 0)
         try:
-            if self._playhead_line_id is None:
+            if self._playhead_line_id is None or self._playhead_head_id is None:
                 raise TypeError("no playhead line drawn yet")
             self.canvas.coords(self._playhead_line_id, x, RULER_HEIGHT, x, bottom)
+            self.canvas.coords(self._playhead_head_id,
+                               *self._playhead_head_points(x))
         except Exception:
             # No line to move yet (e.g. playback just started before any
             # full draw happened with a playhead set), or the canvas item
