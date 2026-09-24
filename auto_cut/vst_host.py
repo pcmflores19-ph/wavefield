@@ -895,7 +895,7 @@ class TrackChain:
                                          sample_rate, reset)
         if log and slot.channels != before:
             log(f"  {slot.name}: needs {slot.channels} input channels; "
-                f"feeding the mono track on all of them")
+                f"feeding the mono audio on all of them")
         return out
 
     @staticmethod

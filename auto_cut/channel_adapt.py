@@ -37,6 +37,30 @@ def required_input_channels(exc):
     return int(match.group(1)) if match else None
 
 
+def _call(plugin, audio, sample_rate, reset):
+    """
+    `plugin(audio, sample_rate, reset=reset)`, tolerating a plugin that can only
+    reset on the main thread.
+
+    Some VST3s (PodcastPlugins MASTER) can only be reset by reloading them, and
+    pedalboard allows that on the main thread alone; from any other thread -
+    the audio callback, the editor window's feed thread - `reset=True` raises
+    "must be reloaded on the main thread ... pass reset=False". Without this
+    the editor's feed died on its very first block (the window's meters never
+    moved and its switches never reached the plugin), and live playback
+    dropped the master for the first block after every seek. The audio still
+    has to be processed, so it goes through without the reset: the plugin
+    keeps its previous internal state instead of starting fresh, which is far
+    better than not processing at all.
+    """
+    try:
+        return plugin(audio, sample_rate, reset=reset)
+    except RuntimeError as exc:
+        if reset and "main thread" in str(exc):
+            return plugin(audio, sample_rate, reset=False)
+        raise
+
+
 def process_mono(plugin, state, audio, sample_rate, reset):
     """
     `plugin(audio, sample_rate, reset=reset)` for mono `audio` of shape (1, n),
@@ -48,14 +72,14 @@ def process_mono(plugin, state, audio, sample_rate, reset):
     """
     if state.channels == 1:
         try:
-            return plugin(audio, sample_rate, reset=reset)
+            return _call(plugin, audio, sample_rate, reset)
         except ValueError as exc:
             wanted = required_input_channels(exc)
             if audio.shape[0] != 1 or wanted is None or wanted < 2:
                 raise
             state.channels = wanted
-    out = plugin(numpy.repeat(audio, state.channels, axis=0), sample_rate,
-                 reset=reset)
+    out = _call(plugin, numpy.repeat(audio, state.channels, axis=0),
+                sample_rate, reset)
     if out.shape[0] == 1:
         return out
     return out.mean(axis=0, keepdims=True)

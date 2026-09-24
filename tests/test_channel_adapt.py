@@ -109,3 +109,51 @@ def test_skipped_plugin_is_recorded_not_silent():
     out = chain.process(audio, 44100, reset=True)
     np.testing.assert_array_equal(out, audio)       # passed through
     assert "plugin exploded" in slot.last_error
+
+
+# ------------------------------------------- plugins that only reset on the main thread
+
+class _MainThreadResetOnly:
+    """Like PodcastPlugins MASTER: reset=True off the main thread raises."""
+
+    def __init__(self, channels=1):
+        self.channels, self.calls = channels, []
+
+    def __call__(self, audio, sample_rate, reset=False):
+        self.calls.append(reset)
+        if audio.shape[0] != self.channels:
+            raise ValueError(
+                f"Plugin 'Stub' does not support {audio.shape[0]}-channel "
+                f"output. (Main bus currently expects {self.channels} input "
+                f"channels and {self.channels} output channels.)")
+        if reset:
+            raise RuntimeError(
+                "Plugin stub.vst3 must be reloaded on the main thread. Please "
+                "pass `reset=False` if calling this plugin from a non-main "
+                "thread.")
+        return audio * 0.5
+
+
+@pytest.mark.parametrize("width", [1, 2])
+def test_a_reset_refused_off_the_main_thread_still_processes_the_block(width):
+    plugin, state = _MainThreadResetOnly(width), types.SimpleNamespace(channels=1)
+    audio = _mono()
+    out = channel_adapt.process_mono(plugin, state, audio, 44100, True)
+    np.testing.assert_allclose(out, audio * 0.5, rtol=1e-6)
+    assert plugin.calls[-1] is False          # went through without the reset
+
+
+def test_only_the_main_thread_reset_error_is_absorbed():
+    def broken(audio, sample_rate, reset=False):
+        raise RuntimeError("something else entirely")
+    with pytest.raises(RuntimeError):
+        channel_adapt.process_mono(broken, types.SimpleNamespace(channels=1),
+                                   _mono(), 44100, True)
+
+
+def test_chain_does_not_drop_the_first_block_for_such_a_plugin():
+    chain, slot = _chain_with(_MainThreadResetOnly(2))
+    audio = _mono().reshape(-1)
+    out = chain.process(audio, 44100, reset=True)
+    np.testing.assert_allclose(out, audio * 0.5, rtol=1e-6)
+    assert slot.last_error is None
