@@ -1,7 +1,7 @@
 """Single source of the version number - the app, the About box and the
 installer all read it from here so they cannot drift apart."""
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 
 APP_NAME = "Wavefield"
 PROJECT_URL = "https://github.com/pcmflores19-ph/wavefield"

@@ -21,6 +21,12 @@ class _StubApp:
 
     def __init__(self):
         self.analysis_done_called = False
+        self.apply_edits_saw = None
+
+    def _apply_edits(self):
+        # Pushes the auto-mutes just committed into the player's tracks; must
+        # therefore run after auto_mutes is set (see the test below).
+        self.apply_edits_saw = self.auto_mutes
 
     def _analysis_done(self):
         self.analysis_done_called = True
@@ -83,3 +89,15 @@ def test_analysis_done_runs_after_the_commit():
     assert seen["peaks_list"] == results["peaks_list"]
     assert seen["audio_durations"] == results["audio_durations"]
     assert seen["timeline_duration"] == results["timeline_duration"]
+
+
+def test_new_auto_mutes_are_pushed_to_the_player_after_they_are_committed():
+    """A fresh analysis pass must reach playback: _apply_edits() is the only
+    thing that copies mute ranges into the player's tracks, so it has to run
+    (after auto_mutes is set, before _analysis_done redraws)."""
+    stub = _StubApp()
+    results = _payload()
+
+    app_module.AutoCutApp._apply_analysis_results(stub, results)
+
+    assert stub.apply_edits_saw == results["auto_mutes"]
