@@ -137,6 +137,11 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
         self.player = Player()
         self.track_vars = []
         self.track_chains = []       # one vst_host.TrackChain per speaker
+        # The master bus: one chain over the summed mix (see player.py and
+        # audio_export.apply_master). Not tied to a speaker, so it exists
+        # before any recording is added.
+        self.master_chain = vst_host.TrackChain()
+        self.player.master_chain = self.master_chain
         self.fx_buttons = []
         # Hand edits layered on the automatic cuts, in order - later edits win
         # where they overlap, so you can cut, then restore part of that cut.
@@ -172,6 +177,9 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
         self._autosave_job = None
 
         self._build_ui()
+        # So the MASTER effects button is there from the start - the master
+        # chain does not depend on any recording being loaded.
+        self._build_mixer()
         self._update_aggr_label()
         self._set_project_path(None)
         self._render_transcript()
@@ -2637,6 +2645,7 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
         if not names:
             ttk.Label(self.mixer_frame, text="Add recordings to see tracks.",
                       style="PanelDim.TLabel").pack(anchor="w")
+            self._build_master_row()
             return
 
         for i, name in enumerate(names):
@@ -2686,6 +2695,38 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
             ttk.Label(fader, text="%", style="PanelDim.TLabel").pack(side="left")
 
             self._refresh_fx_button(i)
+
+        self._build_master_row()
+
+    def _build_master_row(self):
+        """
+        The master bus's own effects button, under the speakers. The master is
+        the summed mix, so it sits apart from the per-speaker rows and is there
+        even before a recording is added.
+        """
+        ttk.Separator(self.mixer_frame).pack(fill="x", pady=(10, 2))
+        row = ttk.Frame(self.mixer_frame, style="Panel.TFrame")
+        row.pack(fill="x", pady=(4, 0))
+        ttk.Label(row, text="MASTER  (the mix)",
+                  style="Panel.TLabel").pack(side="left")
+        self.master_fx_button = ttk.Button(row, width=9,
+                                           command=self.open_master_fx)
+        self.master_fx_button.pack(side="right")
+        self._refresh_master_fx_button()
+
+    def _refresh_master_fx_button(self):
+        button = getattr(self, "master_fx_button", None)
+        if button is None:
+            return
+        chain = self.master_chain
+        n = len(chain.slots)
+        label = f"FX ({n})"
+        if n and not chain.enabled:
+            label += " off"
+        try:
+            button.config(text=label)
+        except tk.TclError:
+            pass        # the mixer was rebuilt and this button is gone
 
     def _set_track(self, index, gain=None, muted=None, soloed=None):
         """Mixer changes only apply once audio is loaded; before that they're
@@ -2743,6 +2784,42 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
         FxDialog(self.root, name, self.track_chains[index],
                 on_change=on_change, log=self.log, player=self.player,
                 on_replace=on_replace, track=self.player.tracks[index])
+
+    def open_master_fx(self):
+        """
+        The master bus's effects: the FX dialog on the chain that runs over the
+        summed mix. Same dialog as a speaker's, pointed at self.master_chain.
+        """
+        if not vst_host.is_available():
+            messagebox.showwarning(
+                "pedalboard not installed",
+                "VST3 hosting needs the 'pedalboard' package:\n\n"
+                "    pip install pedalboard")
+            return
+
+        class _MasterMeter:
+            """Gives the dialog's loudness meter the level of the whole mix,
+            where a speaker's dialog reads that speaker's Track."""
+            def __init__(self, player):
+                self._player = player
+
+            @property
+            def peak_level(self):
+                return self._player.master_peak
+
+        def on_change():
+            self._refresh_master_fx_button()
+            self.log(f"Master chain: {self.master_chain.describe()}")
+
+        def on_replace(chain):
+            # As open_fx's on_replace: the app's reference (what gets saved and
+            # exported) and the player's (what the callback runs) move together.
+            self.master_chain = chain
+            self.player.master_chain = chain
+
+        FxDialog(self.root, "MASTER (the mix)", self.master_chain,
+                 on_change=on_change, log=self.log, player=self.player,
+                 on_replace=on_replace, track=_MasterMeter(self.player))
 
     def _choose_bookend(self, which):
         path = filedialog.askopenfilename(
@@ -2812,6 +2889,7 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
                 gains=gains, stems=self.export_stems.get(),
                 intro_path=self.intro_path, outro_path=self.outro_path,
                 progress=progress, should_cancel=self._export_cancelled,
+                master_chain=self.master_chain,
             )
             if not written:
                 self.log("Audio export cancelled.")
@@ -3106,7 +3184,7 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
     def _render_mix(self, keep_ranges, gains):
         """The summed, processed, cut audio - what export_audio writes."""
         import effects
-        from audio_export import render_tracks
+        from audio_export import apply_master, render_tracks
         from player import SAMPLE_RATE
 
         progress = self._track_render_progress()
@@ -3119,6 +3197,11 @@ class AutoCutApp(UIBuilderMixin, ActionsMixin):
                                        chains=self.track_chains, gains=gains,
                                        progress=progress,
                                        should_cancel=self._export_cancelled)
+
+        # The master bus goes on the finished sum, ahead of the safety limiter
+        # below - the same order the WAV export (export_audio) uses.
+        mix = apply_master(mix, self.master_chain, progress=progress,
+                           should_cancel=self._export_cancelled)
 
         # Chunked so a long episode's true-peak pass never holds the whole
         # mix and its oversampled copy in memory at once. True peak's

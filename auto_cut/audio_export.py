@@ -428,6 +428,41 @@ def write_wav(path, audio, sample_rate=SAMPLE_RATE):
     return path
 
 
+def apply_master(mix, master_chain, progress=None, should_cancel=None):
+    """
+    Runs the master bus over the finished, summed mix and returns the result.
+
+    Mirrors what a DAW's master bus does: it sees the sum of every track, after
+    their own effects, and comes BEFORE the -1 dBTP safety limiter the callers
+    apply next. Stems and the per-track media for Resolve never come through
+    here - only the mixdown does, the same way a single track rendered from a
+    DAW does not carry the master bus.
+
+    One continuous pass over the whole mix on a detached snapshot, for the same
+    reasons render_track does it that way (see TrackChain.snapshot and
+    process_slots: live plugins must not be driven from a second thread, and
+    latency-compensating plugins must not be fed in blocks). A master that
+    cannot be applied hands the mix back untouched, with a loud message - an
+    export quietly missing its master is the failure this is built to avoid.
+    """
+    if (master_chain is None or mix is None or mix.size == 0
+            or not master_chain.active_slots()):
+        return mix
+    if should_cancel and should_cancel():
+        return mix
+    offline = master_chain.snapshot(log=progress)
+    if progress:
+        progress(f"mastering the mix through {offline.describe()}")
+    processed = offline.process(mix, SAMPLE_RATE, reset=True, log=progress,
+                                should_cancel=should_cancel)
+    if processed.size == mix.size:
+        return processed
+    if progress:
+        progress(f"WARNING: the master chain came back {processed.size} "
+                 f"samples for {mix.size}; it was NOT applied to the mix")
+    return mix
+
+
 def limit_to_ceiling(audio):
     """
     Applies the same -1 dBTP safety ceiling (effects.LIMITER_CEILING_DB) the
@@ -448,7 +483,7 @@ def limit_to_ceiling(audio):
 
 def export_audio(out_path, speaker_paths, keep_ranges, mutes=None, chains=None,
                  gains=None, stems=False, intro_path=None, outro_path=None,
-                 progress=None, should_cancel=None):
+                 progress=None, should_cancel=None, master_chain=None):
     """
     Renders every speaker and writes either a single mixdown (default) or one
     stem per speaker alongside it.
@@ -456,6 +491,8 @@ def export_audio(out_path, speaker_paths, keep_ranges, mutes=None, chains=None,
     mutes:  [(speaker_index, start, end)]
     chains: [TrackChain or None] per speaker
     gains:  [float] per speaker
+    master_chain: TrackChain run over the summed mix (mixdown only - stems stay
+        exactly what each speaker's own chain produced)
     intro_path / outro_path: audio dropped in front of / after the episode,
         untouched by cuts, mutes and VSTs. Mixdown only - stems stay clean.
 
@@ -507,6 +544,22 @@ def export_audio(out_path, speaker_paths, keep_ranges, mutes=None, chains=None,
                 os.remove(tmp_path)
         raise
 
+    if should_cancel and should_cancel():
+        for tmp_path, _final_path in tmp_stem_paths:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        return [], 0.0
+
+    # Before the stems are moved into place, so a cancel or failure here still
+    # leaves no partial set of files behind - same all-or-nothing rule as above.
+    try:
+        mix = apply_master(mix, master_chain, progress=progress,
+                           should_cancel=should_cancel)
+    except BaseException:
+        for tmp_path, _final_path in tmp_stem_paths:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        raise
     if should_cancel and should_cancel():
         for tmp_path, _final_path in tmp_stem_paths:
             if os.path.exists(tmp_path):

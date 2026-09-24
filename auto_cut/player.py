@@ -132,6 +132,17 @@ class Player:
         # to span. Consumed (and cleared) by the very next _mix_into call.
         self._reset_pending = True
 
+        # The master bus: a vst_host.TrackChain run over the SUMMED mix, after
+        # every track's own chain and before the meter and the -1 dBTP safety
+        # limiter. Set by the app; None or empty means no master processing.
+        self.master_chain = None
+        # Like _reset_pending, but only an explicit seek sets it - NOT the
+        # callback jumping over a cut. Export runs the master over the already
+        # cut mix in one continuous pass, so the live master must not restart
+        # at every cut either (a restart costs tens of ms, longer than a
+        # block, and would also throw away the level it had settled on).
+        self._master_reset_pending = True
+
     # ---------- setup ----------
 
     def load(self, paths, names=None):
@@ -197,6 +208,7 @@ class Player:
             self._pos = int(max(0.0, min(seconds, self.duration)) * SAMPLE_RATE)
             self._resync_segment()
             self._reset_pending = True
+            self._master_reset_pending = True
 
     def skip(self, delta_seconds):
         self.seek(self.position + delta_seconds)
@@ -368,6 +380,40 @@ class Player:
                                tracks, reset=reset)
                 self._pos += take
                 filled += take
+
+            # Master bus. Same rules as a track chain: never wait (a pending
+            # plugin load just means this block goes through unmastered), and
+            # never let a plugin fault kill the stream. The restart flag is
+            # only consumed when the pass actually ran, so a block that was
+            # declined does not lose the seek's restart.
+            master = self.master_chain
+            if filled and master is not None:
+                # Feed the summed, pre-master mix to any open master plugin
+                # editor - exactly what _mix_into does for a track's editor,
+                # and for the same reason: the editor runs its OWN plugin
+                # instance, and a plugin only reports parameter changes made
+                # in its window (a bypass switch, a knob) once audio has been
+                # processed. Without this the window's meters sit still AND
+                # its switches never reach the plugin that is actually heard.
+                # Upstream of the enabled/bypassed check, like the track tap.
+                for slot in master.slots:
+                    q = getattr(slot, "editor_audio_queue", None)
+                    if q is not None:
+                        try:
+                            q.put_nowait(out.copy())
+                        except queue.Full:
+                            pass
+
+                if master.enabled and master.slots:
+                    try:
+                        processed = master.process_slots(
+                            out, SAMPLE_RATE, master.slots,
+                            reset=self._master_reset_pending, gate_timeout=0.0)
+                        self._master_reset_pending = False
+                        if processed.size == out.size:
+                            out = processed
+                    except Exception:
+                        pass
 
         # Master level measured before limiting (true peak, so overs the
         # limiter is about to catch - and overs a lossy export re-encode

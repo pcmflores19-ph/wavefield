@@ -52,6 +52,9 @@ def build(app):
             for t in app.player.tracks
         ],
         "chains": [_chain_to_dict(c) for c in app.track_chains],
+        # The master bus (the chain over the summed mix). Absent from projects
+        # saved before it existed; load treats a missing key as "no master".
+        "master_chain": _chain_to_dict(app.master_chain),
         "intro_path": app.intro_path,
         "outro_path": app.outro_path,
         "export_stems": bool(app.export_stems.get()),

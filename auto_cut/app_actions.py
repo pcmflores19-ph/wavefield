@@ -37,6 +37,10 @@ class ActionsMixin:
         self.mute_edits.clear()
         self.edit_history.clear()
         self.track_chains.clear()
+        # A new project starts with no master processing either - the previous
+        # episode's master settings must not silently colour the next one.
+        self.master_chain = project_io._chain_from_dict({"slots": []})
+        self.player.master_chain = self.master_chain
         self.transcript = None
         self.intro_path = None
         self.outro_path = None
@@ -226,6 +230,13 @@ class ActionsMixin:
                                  for c in chains]
             for track, chain in zip(self.player.tracks, self.track_chains):
                 track.chain = chain
+        # Projects saved before the master bus existed have no "master_chain"
+        # key: they open with an empty master, exactly as they used to sound.
+        master = data.get("master_chain")
+        self.master_chain = project_io._chain_from_dict(
+            master if isinstance(master, dict) else {"slots": []},
+            log=self.log)
+        self.player.master_chain = self.master_chain
         self._pending_project = None
         self._build_mixer()
         # No waveform refresh needed here: the drawn waveform is always the
