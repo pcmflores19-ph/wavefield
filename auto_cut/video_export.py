@@ -633,8 +633,11 @@ def render(video_path, audio_path, out_path, keep_ranges, crf=DEFAULT_CRF,
         # than handing someone an ffmpeg backtrace. Restarts the whole video
         # phase on CPU rather than mixing GPU- and libopenh264-encoded clips
         # in one concat, which is untested and a real corruption/desync risk.
-        if use_gpu and any(kw in lowered for kw in
-                           ("nvenc", "cuda", "hwaccel", "amf", "qsv")):
+        # Whole-word match: "amf" must not fire on some unrelated word, but
+        # ffmpeg names the encoders "h264_amf"/"h264_qsv", so an underscore
+        # counts as a boundary here (only letters do not).
+        if use_gpu and re.search(
+                r"(?<![a-z])(nvenc|cuda|hwaccel|amf|qsv)(?![a-z])", lowered):
             if progress:
                 progress(0.0, "GPU encoder unavailable - encoding on the "
                               "processor instead (slower)")

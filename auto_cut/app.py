@@ -3535,6 +3535,16 @@ def main():
                           PLAYER_SAMPLE_RATE, effects.defaults("compressor"))
         except Exception:
             pass
+        # The gate's state machine and the EQ's one-pole filter are numba
+        # loops too (effects._gate_loop / _one_pole_loop); the packaged
+        # build always runs the EQ through the latter. Same warm-up, for the
+        # same reason: never compile them inside the audio callback.
+        try:
+            silence = np.zeros(4096, dtype=np.float32)
+            effects.noise_gate(silence, PLAYER_SAMPLE_RATE, state={})
+            effects._one_pole_loop(silence, 0.5, 0.0)
+        except Exception:
+            pass
 
     threading.Thread(target=_warm_native_effects, daemon=True).start()
 
